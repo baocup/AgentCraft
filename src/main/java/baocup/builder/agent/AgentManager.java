@@ -23,10 +23,11 @@ import com.google.gson.JsonObject;
 
 import baocup.builder.BuilderConfig;
 import baocup.builder.BuilderMod;
-import baocup.builder.item.BuildCommanderItem;
 import baocup.builder.item.ExternalBuildWandItem;
 import baocup.builder.item.ItemData;
 import baocup.builder.memory.BuildMemory;
+import baocup.builder.memory.BuildRegion;
+import baocup.builder.memory.ForbiddenZone;
 import baocup.builder.memory.MemoryStore;
 import baocup.builder.memory.SelectionStore;
 import baocup.builder.net.ModPackets;
@@ -77,8 +78,6 @@ public final class AgentManager {
     private final Set<String> dirtyStates = new LinkedHashSet<>();
     private final SelectionStore selections = new SelectionStore();
     private final LlmClient llm = new LlmClient();
-    /** MCP 桥：外部 Agent 通过 tool calling 直接建造，不经过 LlmClient。 */
-    private final McpBridge mcpBridge = new McpBridge(this);
 
     private MinecraftServer server;
     private MemoryStore store;
@@ -231,7 +230,6 @@ public final class AgentManager {
         m.jobs.clear();
         m.commitJobs.clear();
         m.dirtyStates.clear();
-        m.mcpBridge.shutdown();
         m.server = null;
     }
 
@@ -259,10 +257,10 @@ public final class AgentManager {
         return best;
     }
 
-    /** 三条建造链路互斥，避免同一个任务被两个执行器同时写世界。 */
+    /** 建造链路互斥，避免同一个任务被两个执行器同时写世界。 */
     public boolean hasActiveBuild(String taskId) {
         return jobs.containsKey(taskId) || buildAgents.containsKey(taskId)
-                || mcpBridge.isActive(taskId);
+                || commitJobs.containsKey(taskId);
     }
 
     /** 全部任务记忆（按创建顺序），供 MCP 的 list_tasks 使用。 */
@@ -274,19 +272,6 @@ public final class AgentManager {
         return server;
     }
 
-    /** /builder approve [taskId]：批准待处理的坐标请求。 */
-    public String approveBounds(ServerPlayer player, String taskId) {
-        return mcpBridge.approve(player, taskId);
-    }
-
-    /** /builder deny [taskId]：拒绝待处理的坐标请求。 */
-    public String denyBounds(ServerPlayer player, String taskId) {
-        return mcpBridge.deny(player, taskId);
-    }
-
-    public String mcpStatus() {
-        return mcpBridge.status();
-    }
 
     public void setSelection(Player player, Bounds bounds, String dimension) {
         selections.set(player.getUUID(), bounds, dimension);
@@ -298,11 +283,12 @@ public final class AgentManager {
     private BuildMemory createMemory(ServerPlayer player, String taskId, String mode) {
         BuildMemory existing = memories.get(taskId);
         if (existing != null) {
+            existing.ensureRegions();
             return existing;
         }
         BuildMemory m = new BuildMemory();
         m.taskId = taskId;
-        m.linkMode = mode == null || mode.isBlank() ? "internal" : mode;
+        m.linkMode = "external";
         m.ownerUuid = player.getUUID().toString();
         m.ownerName = player.getGameProfile().getName();
         m.dimension = player.serverLevel().dimension().location().toString();
@@ -312,6 +298,7 @@ public final class AgentManager {
             m.dimension = selection.dimension == null ? m.dimension : selection.dimension;
             m.hasBounds = true;
         }
+        m.ensureRegions();
         memories.put(taskId, m);
         log(taskId, "记忆", "INFO", "已为本物品创建独立记忆 " + taskId
                 + (m.hasBounds ? "，自动载入已选范围 " + m.bounds.display() : "，尚未选择范围"));
@@ -349,7 +336,7 @@ public final class AgentManager {
         final String shortBrief = brief;
         for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
             ItemStack stack = player.getInventory().getItem(i);
-            if (!(stack.getItem() instanceof BuildCommanderItem) || !m.taskId.equals(ItemData.taskId(stack))) {
+            if (!(stack.getItem() instanceof ExternalBuildWandItem) || !m.taskId.equals(ItemData.taskId(stack))) {
                 continue;
             }
             ItemData.update(stack, tag -> {
@@ -869,7 +856,7 @@ public final class AgentManager {
         String data = payload.data() == null ? "" : payload.data();
         // 左键选点：taskId 可能为空（客户端不生成 UUID），由服务端从手持物品权威解析
         if ("select_point".equals(action)) {
-            selectPoint(sp);
+            selectPoint(sp, data);
             return;
         }
         String taskId = payload.taskId();
@@ -900,30 +887,19 @@ public final class AgentManager {
         try {
             switch (action) {
                 case "bounds" -> applyBounds(sp, m, data);
-                case "build" -> startBuild(sp, m, data);
-                case "plan_open" -> {
-                    m.planMode = true;
-                    log(taskId, "Plan", "INFO", "进入对话 Plan 模式：只讨论方案，不会立即建造");
-                    setStatus(taskId, m.status, "Plan 对话");
+                case "selection_mode" -> applySelectionMode(sp, m, data);
+                case "focus_region" -> applyFocusRegion(sp, m, data);
+                case "create_region" -> applyCreateRegion(sp, m, data, null);
+                case "update_region" -> applyUpdateRegion(sp, m, data, null);
+                case "delete_region" -> applyDeleteRegion(sp, m, data, null);
+                case "create_forbidden" -> applyCreateForbidden(sp, m, data, null);
+                case "delete_forbidden" -> applyDeleteForbidden(m, data, null);
+                case "teleport" -> applyTeleport(sp, m, data);
+                case "clear_logs" -> {
+                    m.logs.clear();
+                    markDirty(taskId);
                 }
-                case "plan_exit" -> {
-                    m.planMode = false;
-                    log(taskId, "Plan", "INFO", "退出对话 Plan 模式，可读建造计划保留在记忆中");
-                }
-                case "plan_send" -> sendPlanChat(sp, m, data);
-                case "plan_build" -> buildFromPlan(sp, m, data);
-                case "visual_capture" -> startVisual(m, false, null);
-                case "visual_analyze" -> startVisual(m, true, null);
-                case "visual_custom" -> {
-                    try {
-                        String text = Json.str(parseObject(data), "pose", "");
-                        startVisual(m, true, CameraRig.custom(text));
-                    } catch (Exception e) {
-                        log(taskId, "视觉检查", "WARN", "自定义视角无效：" + e.getMessage());
-                    }
-                }
-                case "stop" -> stopJob(m);
-                default -> BuilderMod.LOGGER.warn("[建造] 未知 GUI 动作 {}", action);
+                default -> log(taskId, "GUI", "WARN", "未知 GUI 动作：" + action);
             }
         } catch (Exception e) {
             log(taskId, "GUI", "ERROR", "处理 " + action + " 失败：" + e.getMessage());
@@ -936,12 +912,28 @@ public final class AgentManager {
         }
     }
 
-    /** 建造物品两次左键选点：用的是玩家自身所在坐标，不是准星指向的方块。 */
-    private void selectPoint(ServerPlayer player) {
+    /** 优先采用客户端准星瞄准的方块；点空或坐标非法时回退玩家站位。 */
+    private static BlockPos selectionPos(ServerPlayer player, String data) {
+        JsonObject args = parseObject(data);
+        if (args.has("pos") && args.get("pos").isJsonArray()) {
+            JsonArray arr = args.getAsJsonArray("pos");
+            if (arr.size() == 3) {
+                try {
+                    return new BlockPos(arr.get(0).getAsInt(), arr.get(1).getAsInt(), arr.get(2).getAsInt());
+                } catch (Exception ignored) {
+                    // 回退玩家站位
+                }
+            }
+        }
+        return player.blockPosition();
+    }
+
+    /** 两次左键以准星瞄准的方块选择根区域、当前区域的子区域或独立禁建区；点空时回退玩家站位。 */
+    private void selectPoint(ServerPlayer player, String data) {
         ItemStack stack = null;
         for (InteractionHand hand : InteractionHand.values()) {
             ItemStack candidate = player.getItemInHand(hand);
-            if (candidate.getItem() instanceof BuildCommanderItem) {
+            if (candidate.getItem() instanceof ExternalBuildWandItem) {
                 stack = candidate;
                 break;
             }
@@ -957,57 +949,141 @@ public final class AgentManager {
         lastSelect.put(player.getUUID(), now);
 
         String taskId = ItemData.ensureTaskId(stack);
-        BuildMemory m = createMemory(player, taskId, heldLinkMode(player));
-        CompoundTag tag = ItemData.read(stack);
-        BlockPos pos = player.blockPosition();
-        String dimension = player.serverLevel().dimension().location().toString();
-        BlockPos first = ItemData.point(tag, ItemData.P1);
-        BlockPos second = ItemData.point(tag, ItemData.P2);
-        String shown = "(" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")";
-
-        if (first == null || second != null) {
-            ItemData.update(stack, t -> {
-                ItemData.putPoint(t, ItemData.P1, pos);
-                t.remove(ItemData.P2);
-                t.putString(ItemData.DIM, dimension);
-            });
-            player.sendSystemMessage(Component.literal("§b[选区] §f起点 = 你当前位置 " + shown
-                    + "，请走到另一个位置再左键一次"));
-            log(taskId, "选点", "INFO", "左键设置起点（玩家自身坐标）" + shown);
+        BuildMemory m = createMemory(player, taskId, "external");
+        ItemData.Data selection = ItemData.get(stack);
+        if (!selection.isArmed()) {
+            // NONE：未武装，左键不落任何点
             return;
         }
-        ItemData.update(stack, t -> {
-            ItemData.putPoint(t, ItemData.P2, pos);
-            t.putString(ItemData.DIM, dimension);
-        });
-        Bounds bounds = Bounds.of(first, pos);
-        setSelection(player, bounds, dimension);
-        m.bounds = bounds;
-        m.hasBounds = true;
-        m.dimension = dimension;
-        player.sendSystemMessage(Component.literal("§a[选区] §f终点 = 你当前位置 " + shown
-                + "，范围 " + bounds.display()));
-        player.sendSystemMessage(Component.literal("§7[选区] §f右键打开建造 GUI 即可使用该范围"));
-        log(taskId, "选点", "INFO", "左键设置终点（玩家自身坐标）" + shown
-                + "，范围 " + bounds.display() + "（" + dimension + "）");
-        markDirty(taskId);
-        saveMemory(m);
-    }
+        BlockPos pos = selectionPos(player, data);
+        String dimension = player.serverLevel().dimension().location().toString();
+        String shown = "(" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")";
+        String type = selection.selectionMode == ItemData.SelectionMode.FORBIDDEN_ZONE ? "禁建区"
+                : selection.selectionMode == ItemData.SelectionMode.CHILD_REGION ? "细分区" : "建造区";
+        boolean differentDimension = selection.selP1 != null && !dimension.equals(selection.selDim);
+        if (selection.selP1 == null || differentDimension) {
+            ItemData.setPendingStart(stack, pos, dimension);
+            player.sendSystemMessage(Component.literal("§b[" + type + "] §f起点 = " + shown + "，移动后再次左键"));
+            log(taskId, "选点", "INFO", type + "起点 " + shown);
+            syncHeldItem(player);
+            return;
+        }
 
-    /** 玩家手持外部 Agent 物品时返回 external，否则 internal。 */
-    private String heldLinkMode(ServerPlayer player) {
-        for (InteractionHand hand : InteractionHand.values()) {
-            if (player.getItemInHand(hand).getItem() instanceof ExternalBuildWandItem) {
-                return "external";
+        Bounds bounds = Bounds.of(selection.selP1, pos);
+        if (bounds.y1 < player.serverLevel().getMinBuildHeight()
+                || bounds.y2 >= player.serverLevel().getMaxBuildHeight()) {
+            player.sendSystemMessage(Component.literal("§c[选区] 两点超出当前世界可建造高度"));
+            ItemData.disarm(stack);
+            syncHeldItem(player);
+            return;
+        }
+        if (selection.selectionMode == ItemData.SelectionMode.ROOT) {
+            int[] b = bounds.toArray();
+            BlockPos first = new BlockPos(b[0], b[1], b[2]);
+            BlockPos second = new BlockPos(b[3], b[4], b[5]);
+            ItemData.update(stack, tag -> {
+                ItemData.putPoint(tag, ItemData.P1, first);
+                ItemData.putPoint(tag, ItemData.P2, second);
+                tag.putString(ItemData.DIM, dimension);
+            });
+            setSelection(player, bounds, dimension);
+            m.resetRegions(bounds);
+            m.dimension = dimension;
+            m.blocksPlacedTotal = 0;
+            player.sendSystemMessage(Component.literal("§a[建造区] §f" + bounds.display() + "，右键打开外部 Agent 面板"));
+        } else {
+            JsonObject args = new JsonObject();
+            args.add("bounds", Json.GSON.toJsonTree(bounds.toArray()));
+            JsonObject result = new JsonObject();
+            if (selection.selectionMode == ItemData.SelectionMode.FORBIDDEN_ZONE) {
+                args.addProperty("name", "禁建区 " + (m.safeForbiddenZones().size() + 1));
+                applyCreateForbidden(player, m, args.toString(), result);
+            } else {
+                // 父级在武装时显式确定（UI 按钮传入），不再用 activeRegionId，
+                // 否则创建并聚焦第一个子区后，第二个子区会被当成它的孩子而校验失败。
+                String parentId = selection.selParent == null || selection.selParent.isBlank()
+                        ? BuildRegion.ROOT_ID : selection.selParent;
+                args.addProperty("parentId", parentId);
+                args.addProperty("name", "细分区 " + m.safeRegions().size());
+                args.addProperty("focus", true);
+                applyCreateRegion(player, m, args.toString(), result);
+            }
+            if (result.has("error")) {
+                player.sendSystemMessage(Component.literal("§c[选区] " + result.get("error").getAsString()));
+            } else {
+                player.sendSystemMessage(Component.literal(selection.selectionMode == ItemData.SelectionMode.FORBIDDEN_ZONE
+                        ? "§c[禁建区] §f已创建并启用放置拦截"
+                        : "§e[细分区] §f已创建并聚焦，外部 Agent 将只载入此范围"));
             }
         }
-        return "internal";
+        // 第二点落下即结束本次选区：无论成功失败都解除武装并清除待选点，
+        // 杜绝残留坐标污染下一次选区（删除区域后尤其重要）。已确认根区边界 P1/P2 不受影响。
+        ItemData.disarm(stack);
+        syncHeldItem(player);
+        log(taskId, "选点", "INFO", "完成选点 " + bounds.display() + "（" + dimension + "）");
+        markDirty(taskId);
+        saveMemory(m);
+        pushState(m, false, player);
+    }
+
+    /** 让客户端立即看到物品 NBT 变化（待选点清除 / 模式回到 NONE / 根区边界写回）。 */
+    private static void syncHeldItem(ServerPlayer player) {
+        player.getInventory().setChanged();
+        player.containerMenu.broadcastChanges();
+    }
+
+    private void applySelectionMode(ServerPlayer player, BuildMemory m, String data) {
+        JsonObject args = parseObject(data);
+        String value = Json.str(args, "mode", ItemData.SelectionMode.NONE.name());
+        ItemData.SelectionMode mode;
+        try {
+            mode = ItemData.SelectionMode.valueOf(value);
+        } catch (Exception e) {
+            log(m.taskId, "选点", "WARN", "未知选点模式：" + value);
+            return;
+        }
+        // 子区父级在武装时显式确定：UI 传 parentId（某行「子区」按钮）；概览「选子区」默认根区。
+        String parentId = null;
+        if (mode == ItemData.SelectionMode.CHILD_REGION) {
+            String requested = Json.str(args, "parentId", "");
+            parentId = requested.isBlank() ? BuildRegion.ROOT_ID : requested;
+            if (m.region(parentId) == null) {
+                parentId = BuildRegion.ROOT_ID;
+            }
+        }
+        for (InteractionHand hand : InteractionHand.values()) {
+            ItemStack stack = player.getItemInHand(hand);
+            if (stack.getItem() instanceof ExternalBuildWandItem && m.taskId.equals(ItemData.taskId(stack))) {
+                if (mode == ItemData.SelectionMode.NONE) {
+                    ItemData.disarm(stack);
+                    player.sendSystemMessage(Component.literal("§7[选点] §f已取消选点模式；左键不再落点"));
+                } else {
+                    ItemData.arm(stack, mode, parentId);
+                    String label = mode == ItemData.SelectionMode.FORBIDDEN_ZONE ? "禁建区"
+                            : mode == ItemData.SelectionMode.CHILD_REGION ? "细分区" : "根建造区";
+                    String extra = "";
+                    if (mode == ItemData.SelectionMode.CHILD_REGION) {
+                        BuildRegion parent = m.region(parentId);
+                        extra = "（父级：" + (parent == null ? "根区" : parent.name) + "）";
+                    }
+                    player.sendSystemMessage(Component.literal("§b[选点] §f左键选择两点，完成后自动退出选点；当前模式："
+                            + label + extra));
+                }
+                syncHeldItem(player);
+                return;
+            }
+        }
+        log(m.taskId, "选点", "WARN", "请手持对应建造手杖再开始选点");
+    }
+
+    private String heldLinkMode(ServerPlayer player) {
+        return "external";
     }
 
     private boolean authorized(ServerPlayer player, String taskId) {
         for (InteractionHand hand : InteractionHand.values()) {
             ItemStack stack = player.getItemInHand(hand);
-            if (stack.getItem() instanceof BuildCommanderItem && taskId.equals(ItemData.taskId(stack))) {
+            if (stack.getItem() instanceof ExternalBuildWandItem && taskId.equals(ItemData.taskId(stack))) {
                 return true;
             }
         }
@@ -1041,16 +1117,16 @@ public final class AgentManager {
             return;
         }
         Bounds bounds = Bounds.fromArray(values);
-        bounds.y1 = Math.max(-64, Math.min(319, bounds.y1));
-        bounds.y2 = Math.max(-64, Math.min(319, bounds.y2));
-        bounds.normalize();
-        if (bounds.volume() > BuilderConfig.MAX_VOLUME.getAsLong()) {
-            log(m.taskId, "坐标", "WARN", "范围体积 " + bounds.volume() + " 超过上限 "
-                    + BuilderConfig.MAX_VOLUME.getAsLong() + "，已拒绝");
+        int worldMin = player.serverLevel().getMinBuildHeight();
+        int worldMax = player.serverLevel().getMaxBuildHeight() - 1;
+        if (bounds.y2 < worldMin || bounds.y1 > worldMax) {
+            log(m.taskId, "坐标", "WARN", "选区完全超出当前世界高度 " + worldMin + ".." + worldMax);
             return;
         }
-        m.bounds = bounds;
-        m.hasBounds = true;
+        bounds.y1 = Math.max(worldMin, bounds.y1);
+        bounds.y2 = Math.min(worldMax, bounds.y2);
+        bounds.normalize();
+        m.resetRegions(bounds);
         m.dimension = player.serverLevel().dimension().location().toString();
         setSelection(player, bounds, m.dimension);
         // 关键：客户端 MCP 是从物品 NBT 读选区的，只改记忆的话外部 Agent 永远看不到手动输入的范围
@@ -1059,11 +1135,296 @@ public final class AgentManager {
         markDirty(m.taskId);
     }
 
+    private static Bounds boundsArgument(JsonObject args, String key) {
+        JsonArray array = args == null ? null : args.getAsJsonArray(key);
+        if (array == null || array.size() != 6) {
+            throw new IllegalArgumentException(key + " 需要 [x1,y1,z1,x2,y2,z2] 六个整数");
+        }
+        int[] values = new int[6];
+        for (int i = 0; i < 6; i++) {
+            values[i] = array.get(i).getAsInt();
+        }
+        return Bounds.fromArray(values);
+    }
+
+    private static String cleanText(String value, String fallback, int maxLength) {
+        String text = value == null ? "" : value.trim();
+        if (text.isBlank()) {
+            text = fallback;
+        }
+        return text.length() <= maxLength ? text : text.substring(0, maxLength);
+    }
+
+    private void regionError(BuildMemory m, JsonObject out, String message) {
+        if (out != null) {
+            out.addProperty("error", message);
+        }
+        log(m.taskId, "区域", "WARN", message);
+    }
+
+    private void regionChanged(BuildMemory m) {
+        m.touch();
+        saveMemory(m);
+        markDirty(m.taskId);
+    }
+
+    private void applyFocusRegion(ServerPlayer player, BuildMemory m, String data) {
+        applyFocusRegion(m, data, null);
+    }
+
+    private void applyFocusRegion(BuildMemory m, String data, JsonObject out) {
+        String id = Json.str(parseObject(data), "id", "");
+        BuildRegion region = m.region(id);
+        if (region == null || region.bounds() == null) {
+            regionError(m, out, "区域不存在或没有边界：" + id);
+            return;
+        }
+        m.activeRegionId = region.id;
+        m.status = "IDLE";
+        m.stage = "聚焦区域 · " + region.name;
+        regionChanged(m);
+        if (out != null) {
+            out.addProperty("focused", true);
+            out.addProperty("activeRegionId", region.id);
+            out.add("region", Json.GSON.toJsonTree(region));
+        }
+        log(m.taskId, "区域", "INFO", "已聚焦 " + region.name + " [" + region.id + "]，后续建模只载入该区域");
+    }
+
+    private void applyCreateRegion(ServerPlayer player, BuildMemory m, String data, JsonObject out) {
+        JsonObject args = parseObject(data);
+        String parentId = Json.str(args, "parentId", m.activeRegionId);
+        BuildRegion parent = m.region(parentId);
+        if (parent == null || parent.bounds() == null) {
+            regionError(m, out, "父区域不存在或尚未选区：" + parentId);
+            return;
+        }
+        Bounds bounds;
+        try {
+            bounds = boundsArgument(args, "bounds");
+        } catch (Exception e) {
+            regionError(m, out, e.getMessage());
+            return;
+        }
+        if (!parent.bounds().contains(bounds)) {
+            regionError(m, out, "子区域必须完整包含在父区域内");
+            return;
+        }
+        String id = UUID.randomUUID().toString();
+        String name = cleanText(Json.str(args, "name", ""), "细分区 " + (m.safeRegions().size()), 80);
+        BuildRegion region = new BuildRegion(id, parent.id, name, bounds);
+        region.description = cleanText(Json.str(args, "description", ""), "", 2000);
+        m.safeRegions().add(region);
+        if (Json.bool(args, "focus", true)) {
+            m.activeRegionId = id;
+        }
+        regionChanged(m);
+        if (out != null) {
+            out.add("region", Json.GSON.toJsonTree(region));
+            out.addProperty("activeRegionId", m.activeRegionId);
+        }
+        log(m.taskId, "区域", "INFO", "创建细分区 " + region.name + "，父级 " + parent.name
+                + "，范围 " + bounds.display());
+    }
+
+    private void applyUpdateRegion(ServerPlayer player, BuildMemory m, String data, JsonObject out) {
+        JsonObject args = parseObject(data);
+        String id = Json.str(args, "id", m.activeRegionId);
+        BuildRegion region = m.region(id);
+        if (region == null) {
+            regionError(m, out, "区域不存在：" + id);
+            return;
+        }
+        if (args.has("name")) {
+            region.name = cleanText(Json.str(args, "name", ""), region.name, 80);
+        }
+        if (args.has("description")) {
+            region.description = cleanText(Json.str(args, "description", ""), "", 2000);
+        }
+        if (args.has("status")) {
+            String status = Json.str(args, "status", region.status).toUpperCase(java.util.Locale.ROOT);
+            if (!List.of(BuildRegion.PLANNED, BuildRegion.IN_PROGRESS, BuildRegion.DONE).contains(status)) {
+                regionError(m, out, "status 只能是 PLANNED / IN_PROGRESS / DONE");
+                return;
+            }
+            region.status = status;
+            if (BuildRegion.DONE.equals(status)) {
+                region.progress = 100;
+            }
+        }
+        if (args.has("progress")) {
+            region.progress = Math.max(0, Math.min(100, Json.integer(args, "progress", region.progress)));
+        }
+        if (args.has("bounds")) {
+            if (BuildRegion.ROOT_ID.equals(region.id)) {
+                regionError(m, out, "根区域边界请用 request_bounds 或物品 UI 修改");
+                return;
+            }
+            Bounds bounds;
+            try {
+                bounds = boundsArgument(args, "bounds");
+            } catch (Exception e) {
+                regionError(m, out, e.getMessage());
+                return;
+            }
+            BuildRegion parent = m.region(region.parentId);
+            if (parent == null || !parent.bounds().contains(bounds)) {
+                regionError(m, out, "区域新边界必须完整包含在父区域内");
+                return;
+            }
+            for (BuildRegion child : m.safeRegions()) {
+                if (region.id.equals(child.parentId) && child.bounds() != null && !bounds.contains(child.bounds())) {
+                    regionError(m, out, "新边界不能排除已有子区域：" + child.name);
+                    return;
+                }
+            }
+            region.setBounds(bounds);
+        }
+        region.touch();
+        regionChanged(m);
+        if (out != null) {
+            out.add("region", Json.GSON.toJsonTree(region));
+        }
+        log(m.taskId, "区域", "INFO", "更新区域 " + region.name + "：" + region.status + " " + region.progress + "%");
+    }
+
+    private void applyDeleteRegion(ServerPlayer player, BuildMemory m, String data, JsonObject out) {
+        String id = Json.str(parseObject(data), "id", m.activeRegionId);
+        if (BuildRegion.ROOT_ID.equals(id)) {
+            regionError(m, out, "根建造区不能删除");
+            return;
+        }
+        BuildRegion target = m.region(id);
+        if (target == null) {
+            regionError(m, out, "区域不存在：" + id);
+            return;
+        }
+        Set<String> removed = new HashSet<>();
+        removed.add(id);
+        boolean changed;
+        do {
+            changed = false;
+            for (BuildRegion region : m.safeRegions()) {
+                if (!removed.contains(region.id) && removed.contains(region.parentId)) {
+                    removed.add(region.id);
+                    changed = true;
+                }
+            }
+        } while (changed);
+        m.safeRegions().removeIf(region -> removed.contains(region.id));
+        if (removed.contains(m.activeRegionId)) {
+            m.activeRegionId = m.region(target.parentId) == null ? BuildRegion.ROOT_ID : target.parentId;
+        }
+        regionChanged(m);
+        // 删除区域后立刻解除手持手杖的武装并清除待选点：
+        // 否则残留的 selP1 / selParent 仍指向已删除区域，下次选区会被旧坐标污染。
+        if (player != null) {
+            for (InteractionHand hand : InteractionHand.values()) {
+                ItemStack stack = player.getItemInHand(hand);
+                if (stack.getItem() instanceof ExternalBuildWandItem && m.taskId.equals(ItemData.taskId(stack))) {
+                    ItemData.disarm(stack);
+                }
+            }
+            syncHeldItem(player);
+        }
+        if (out != null) {
+            out.addProperty("deleted", removed.size());
+            out.addProperty("activeRegionId", m.activeRegionId);
+        }
+        log(m.taskId, "区域", "INFO", "删除区域 " + target.name + " 及其后代，共 " + removed.size() + " 个");
+    }
+
+    private void applyCreateForbidden(ServerPlayer player, BuildMemory m, String data, JsonObject out) {
+        JsonObject args = parseObject(data);
+        Bounds bounds;
+        try {
+            bounds = boundsArgument(args, "bounds");
+        } catch (Exception e) {
+            regionError(m, out, e.getMessage());
+            return;
+        }
+        int minY = player.serverLevel().getMinBuildHeight();
+        int maxY = player.serverLevel().getMaxBuildHeight() - 1;
+        if (bounds.y2 < minY || bounds.y1 > maxY) {
+            regionError(m, out, "禁建区完全超出当前世界高度 " + minY + ".." + maxY);
+            return;
+        }
+        bounds.y1 = Math.max(minY, bounds.y1);
+        bounds.y2 = Math.min(maxY, bounds.y2);
+        ForbiddenZone zone = new ForbiddenZone(UUID.randomUUID().toString(),
+                cleanText(Json.str(args, "name", ""), "禁建区 " + (m.safeForbiddenZones().size() + 1), 80), bounds);
+        zone.description = cleanText(Json.str(args, "description", ""), "", 2000);
+        m.safeForbiddenZones().add(zone);
+        regionChanged(m);
+        if (out != null) {
+            out.add("zone", Json.GSON.toJsonTree(zone));
+        }
+        log(m.taskId, "禁建区", "INFO", "创建 " + zone.name + "，范围 " + bounds.display());
+    }
+
+    private void applyDeleteForbidden(BuildMemory m, String data, JsonObject out) {
+        String id = Json.str(parseObject(data), "id", "");
+        boolean removed = m.safeForbiddenZones().removeIf(zone -> id.equals(zone.id));
+        if (!removed) {
+            regionError(m, out, "禁建区不存在：" + id);
+            return;
+        }
+        regionChanged(m);
+        if (out != null) {
+            out.addProperty("deleted", true);
+            out.addProperty("id", id);
+        }
+        log(m.taskId, "禁建区", "INFO", "已删除禁建区 " + id);
+    }
+
+    private void applyTeleport(ServerPlayer player, BuildMemory m, String data) {
+        JsonObject args = parseObject(data);
+        String id = Json.str(args, "id", "");
+        Bounds target;
+        String name;
+        if ("forbidden".equals(Json.str(args, "kind", "region"))) {
+            ForbiddenZone zone = null;
+            for (ForbiddenZone candidate : m.safeForbiddenZones()) {
+                if (candidate.id.equals(id)) {
+                    zone = candidate;
+                    break;
+                }
+            }
+            if (zone == null || zone.bounds() == null) {
+                regionError(m, null, "禁建区不存在：" + id);
+                return;
+            }
+            target = zone.bounds();
+            name = zone.name;
+        } else {
+            BuildRegion region = m.region(id);
+            if (region == null || region.bounds() == null) {
+                regionError(m, null, "区域不存在：" + id);
+                return;
+            }
+            target = region.bounds();
+            name = region.name;
+        }
+        net.minecraft.server.level.ServerLevel level = resolveAnyLevel(server, m.dimension);
+        if (level == null) {
+            level = player.serverLevel();
+        }
+        int x = (int) (((long) target.x1 + target.x2) / 2);
+        int z = (int) (((long) target.z1 + target.z2) / 2);
+        BlockPos top = level.getHeightmapPos(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                new BlockPos(x, 0, z));
+        int y = Math.max(target.y2 + 1, top.getY());
+        y = Math.max(level.getMinBuildHeight() + 1, Math.min(level.getMaxBuildHeight() - 2, y));
+        player.teleportTo(level, x + 0.5, y, z + 0.5, player.getYRot(), player.getXRot());
+        player.sendSystemMessage(Component.literal("§b[传送] §f已到达 " + name
+                + " 的中心上方 (" + x + ", " + y + ", " + z + ")"));
+    }
+
     /** 把范围写回与该任务绑定的手持物品（P1 / P2 / 维度），并触发客户端同步。 */
     private void writeBoundsToHeldItem(ServerPlayer player, String taskId, Bounds bounds) {
         for (InteractionHand hand : InteractionHand.values()) {
             ItemStack stack = player.getItemInHand(hand);
-            if (!(stack.getItem() instanceof BuildCommanderItem)) {
+            if (!(stack.getItem() instanceof ExternalBuildWandItem)) {
                 continue;
             }
             if (!taskId.equals(ItemData.taskId(stack))) {
@@ -1254,10 +1615,13 @@ public final class AgentManager {
     private static final class CommitJob {
         final String taskId;
         final String dimension;
+        String regionId = BuildRegion.ROOT_ID;
         /** TreeMap + y 优先 key：天然按「从下往上」的顺序写入。 */
         final Map<Long, CommitBlock> pending = new java.util.TreeMap<>();
         /** 高风险方块清单：归档前逐个校验有没有被原版规则抹掉，普通方块不记录以节省开销。 */
         final List<PlacedBlock> placed = new ArrayList<>();
+        /** 本次实际写入世界的全部方块：提交完成后并入版本方块图归档，供 resume / 局部预览 / 回滚读取。 */
+        final List<CommitBlock> committed = new ArrayList<>();
         Bounds bounds;
         String summary = "";
         boolean last;
@@ -1267,6 +1631,8 @@ public final class AgentManager {
         int failedState;
         int failedLoaded;
         int vanished;
+        int forbiddenSkipped;
+        int outsideRegion;
         String firstRaw = "";
         String sampleRaw = "";
 
@@ -1287,15 +1653,18 @@ public final class AgentManager {
             return;
         }
         BuildMemory m = memories.get(taskId);
-        if (m == null) {
+        if (m == null && authorized(sp, taskId)) {
             m = createMemory(sp, taskId, "external");
         }
-        if (!m.ownerUuid.isBlank() && !m.ownerUuid.equals(sp.getUUID().toString())) {
-            log(taskId, "提交", "WARN", "非任务所有者提交方块，已拒绝");
+        if (m == null || !authorized(sp, taskId)) {
+            log(taskId, "提交", "WARN", "非任务所有者或未授权物品提交方块，已拒绝");
             return;
         }
-        CommitJob job = commitJobs.computeIfAbsent(taskId,
-                id -> new CommitJob(id, payload.dimension()));
+        m.ensureRegions();
+        if (m.bounds == null) {
+            log(taskId, "提交", "WARN", "尚未选择根建造区，已拒绝提交");
+            return;
+        }
         JsonObject root;
         try {
             root = Json.GSON.fromJson(payload.payload(), JsonObject.class);
@@ -1306,16 +1675,23 @@ public final class AgentManager {
         if (root == null) {
             return;
         }
-        if (job.bounds == null) {
-            JsonArray box = root.getAsJsonArray("bounds");
-            if (box != null && box.size() == 6) {
-                int[] b = new int[6];
-                for (int i = 0; i < 6; i++) {
-                    b[i] = box.get(i).getAsInt();
-                }
-                job.bounds = new Bounds(b[0], b[1], b[2], b[3], b[4], b[5]);
-            }
+        String requestedRegion = Json.str(root, "regionId", m.activeRegionId);
+        BuildRegion region = m.region(requestedRegion);
+        if (region == null || region.bounds() == null) {
+            log(taskId, "提交", "WARN", "提交区域不存在：" + requestedRegion);
+            return;
         }
+        CommitJob job = commitJobs.get(taskId);
+        if (job == null) {
+            job = new CommitJob(taskId, m.dimension == null || m.dimension.isBlank()
+                    ? payload.dimension() : m.dimension);
+            job.regionId = region.id;
+            commitJobs.put(taskId, job);
+        } else if (!job.regionId.equals(region.id)) {
+            log(taskId, "提交", "WARN", "同一提交队列不能混合区域：" + job.regionId + " / " + region.id);
+            return;
+        }
+        job.bounds = region.bounds().copy();
         if (job.summary.isBlank()) {
             job.summary = Json.str(root, "summary", "").trim();
         }
@@ -1332,6 +1708,14 @@ public final class AgentManager {
                     int y = one.get(1).getAsInt();
                     int z = one.get(2).getAsInt();
                     String state = one.get(3).getAsString();
+                    if (!region.bounds().contains(x, y, z)) {
+                        job.outsideRegion++;
+                        continue;
+                    }
+                    if (m.forbiddenAt(x, y, z) != null) {
+                        job.forbiddenSkipped++;
+                        continue;
+                    }
                     if (job.firstRaw.isBlank()) {
                         job.firstRaw = state;
                     }
@@ -1367,12 +1751,27 @@ public final class AgentManager {
             int budget = Math.max(16, BuilderConfig.BLOCKS_PER_TICK.getAsInt());
             int processed = 0;
             List<Long> done = new ArrayList<>();
+            BuildMemory memory = memories.get(job.taskId);
+            BuildRegion region = memory == null ? null : memory.region(job.regionId);
+            Bounds authoritativeBounds = region == null ? null : region.bounds();
             for (Map.Entry<Long, CommitBlock> entry : job.pending.entrySet()) {
                 if (processed >= budget) {
                     break;
                 }
                 CommitBlock block = entry.getValue();
                 BlockPos pos = new BlockPos(block.x(), block.y(), block.z());
+                if (memory != null && memory.forbiddenAt(block.x(), block.y(), block.z()) != null) {
+                    job.forbiddenSkipped++;
+                    done.add(entry.getKey());
+                    processed++;
+                    continue;
+                }
+                if (authoritativeBounds == null || !authoritativeBounds.contains(block.x(), block.y(), block.z())) {
+                    job.outsideRegion++;
+                    done.add(entry.getKey());
+                    processed++;
+                    continue;
+                }
                 var state = BlockIndex.toState(block.fullState());
                 if (state == null) {
                     int bracket = block.fullState().indexOf('[');
@@ -1422,6 +1821,7 @@ public final class AgentManager {
                     job.placed.add(new PlacedBlock(block.x(), block.y(), block.z(), state));
                 }
                 job.written++;
+                job.committed.add(block);
                 done.add(entry.getKey());
                 processed++;
             }
@@ -1505,85 +1905,159 @@ public final class AgentManager {
         out.addProperty("requestId", requestId);
         out.addProperty("query", payload.query());
         out.addProperty("taskId", taskId);
+        BuildMemory m = memories.get(taskId);
+        if (m == null && authorized(sp, taskId)) {
+            m = createMemory(sp, taskId, "external");
+        }
+        if (m == null || !authorized(sp, taskId)) {
+            out.addProperty("error", "没有该任务的访问权限");
+            PacketDistributor.sendToPlayer(sp,
+                    new ModPackets.S2CQueryResult(requestId, Json.GSON.toJson(out)));
+            return;
+        }
+        m.ensureRegions();
         try {
             switch (payload.query()) {
-                case "read_world" -> queryReadWorld(sp, payload.payload(), out);
+                case "read_world" -> queryReadWorld(sp, m, payload.payload(), out);
                 case "get_build_status" -> queryBuildStatus(taskId, out);
-                case "resume" -> queryResume(taskId, out);
+                case "resume" -> queryResume(sp, taskId, payload.payload(), out);
                 case "list_versions" -> queryListVersions(taskId, out);
                 case "revert" -> queryRevert(taskId, payload.payload(), out);
+                case "list_regions" -> {
+                    out.add("regions", Json.GSON.toJsonTree(m.safeRegions()));
+                    out.addProperty("total", m.safeRegions().size());
+                    out.addProperty("activeRegionId", m.activeRegionId);
+                }
+                case "create_region" -> applyCreateRegion(sp, m, payload.payload(), out);
+                case "update_region" -> applyUpdateRegion(sp, m, payload.payload(), out);
+                case "delete_region" -> applyDeleteRegion(sp, m, payload.payload(), out);
+                case "focus_region" -> applyFocusRegion(m, payload.payload(), out);
+                case "list_forbidden_zones" -> out.add("zones", Json.GSON.toJsonTree(m.safeForbiddenZones()));
+                case "create_forbidden" -> applyCreateForbidden(sp, m, payload.payload(), out);
+                case "delete_forbidden" -> applyDeleteForbidden(m, payload.payload(), out);
+                case "request_bounds" -> {
+                    out.addProperty("activeRegionId", m.activeRegionId);
+                    if (m.hasBounds && m.bounds != null) {
+                        out.add("bounds", Json.GSON.toJsonTree(m.bounds.toArray()));
+                    }
+                    if (m.activeRegion().bounds() != null) {
+                        out.add("activeBounds", Json.GSON.toJsonTree(m.activeRegion().bounds));
+                    }
+                }
                 default -> out.addProperty("error", "未知查询：" + payload.query());
             }
         } catch (Exception e) {
             out.addProperty("error", e.getMessage() == null ? e.toString() : e.getMessage());
         }
+        if (!out.has("error") && (payload.query().endsWith("_region") || payload.query().endsWith("_forbidden")
+                || "request_bounds".equals(payload.query()))) {
+            pushState(m, false, sp);
+        }
         PacketDistributor.sendToPlayer(sp,
                 new ModPackets.S2CQueryResult(requestId, Json.GSON.toJson(out)));
     }
 
-    /** 按 region 采样服务端真实方块，带体积与条数上限，避免一次扫平整片地形。 */
-    private void queryReadWorld(ServerPlayer player, String payload, JsonObject out) {
-        JsonObject args = Json.GSON.fromJson(payload, JsonObject.class);
-        JsonArray region = args == null ? null : args.getAsJsonArray("region");
-        if (region == null || region.size() != 6) {
-            out.addProperty("error", "region 需要 [x1,y1,z1,x2,y2,z2] 六个整数");
+    /** 分页扫描选区全部或局部真实地形；单次工作量有限，但整个选区没有体积上限。 */
+    private void queryReadWorld(ServerPlayer player, BuildMemory memory, String payload, JsonObject out) {
+        JsonObject args = parseObject(payload);
+        Bounds box = memory.activeRegion().bounds();
+        String regionId = Json.str(args, "regionId", "");
+        if (!regionId.isBlank()) {
+            BuildRegion selected = memory.region(regionId);
+            if (selected == null) {
+                out.addProperty("error", "区域不存在：" + regionId);
+                return;
+            }
+            box = selected.bounds();
+        }
+        if (args.has("region")) {
+            try {
+                box = boundsArgument(args, "region");
+            } catch (Exception e) {
+                out.addProperty("error", e.getMessage());
+                return;
+            }
+        } else if (Json.bool(args, "root", false)) {
+            box = memory.bounds;
+        }
+        if (box == null) {
+            out.addProperty("error", "请先选择根建造区");
             return;
         }
-        int[] b = new int[6];
-        for (int i = 0; i < 6; i++) {
-            b[i] = region.get(i).getAsInt();
-        }
-        for (int i = 0; i < 3; i++) {
-            if (b[i] > b[i + 3]) {
-                int t = b[i];
-                b[i] = b[i + 3];
-                b[i + 3] = t;
-            }
-        }
-        long volume = (long) (b[3] - b[0] + 1) * (b[4] - b[1] + 1) * (b[5] - b[2] + 1);
-        if (volume > 200000L) {
-            out.addProperty("error", "region 体积 " + volume
-                    + " 过大（上限 200000），请按 y 分层查询");
+        if (memory.bounds == null || !memory.bounds.contains(box)) {
+            out.addProperty("error", "地形检测范围必须位于根建造区内");
             return;
         }
         int limit = Math.max(1, Math.min(8192, Json.integer(args, "limit", 4096)));
-        String dimension = player.serverLevel().dimension().location().toString();
-        var level = resolveAnyLevel(server, dimension);
+        int scanBudget = Math.max(256, Math.min(131072, Json.integer(args, "scanBudget", 32768)));
+        long x = box.x1;
+        long y = box.y1;
+        long z = box.z1;
+        if (args.has("cursor")) {
+            try {
+                JsonArray cursor = args.getAsJsonArray("cursor");
+                if (cursor == null || cursor.size() != 3) {
+                    throw new IllegalArgumentException("cursor 需要 [x,y,z]");
+                }
+                x = cursor.get(0).getAsLong();
+                y = cursor.get(1).getAsLong();
+                z = cursor.get(2).getAsLong();
+            } catch (Exception e) {
+                out.addProperty("error", "cursor 无效：" + e.getMessage());
+                return;
+            }
+        }
+        if (x < box.x1 || x > box.x2 || y < box.y1 || y > box.y2 || z < box.z1 || z > box.z2) {
+            out.addProperty("error", "cursor 不在查询范围内；完成后的游标无需再次请求");
+            return;
+        }
+        var level = player.serverLevel();
         JsonArray blocks = new JsonArray();
-        int found = 0;
-        boolean truncated = false;
-        outer:
-        for (int x = b[0]; x <= b[3]; x++) {
-            for (int z = b[2]; z <= b[5]; z++) {
-                for (int y = b[1]; y <= b[4]; y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    if (!level.isLoaded(pos)) {
-                        continue;
-                    }
-                    var state = level.getBlockState(pos);
-                    if (state.isAir()) {
-                        continue;
-                    }
-                    if (found >= limit) {
-                        truncated = true;
-                        break outer;
-                    }
-                    found++;
+        int scanned = 0;
+        int loaded = 0;
+        while (x <= box.x2 && scanned < scanBudget && blocks.size() < limit) {
+            BlockPos pos = new BlockPos((int) x, (int) y, (int) z);
+            scanned++;
+            if (level.isLoaded(pos)) {
+                loaded++;
+                var state = level.getBlockState(pos);
+                if (!state.isAir()) {
                     JsonArray one = new JsonArray();
-                    one.add(x);
-                    one.add(y);
-                    one.add(z);
+                    one.add((int) x);
+                    one.add((int) y);
+                    one.add((int) z);
                     one.add(String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK
                             .getKey(state.getBlock())));
                     blocks.add(one);
                 }
             }
+            y++;
+            if (y > box.y2) {
+                y = box.y1;
+                z++;
+                if (z > box.z2) {
+                    z = box.z1;
+                    x++;
+                }
+            }
         }
+        boolean hasMore = x <= box.x2;
         out.add("blocks", blocks);
         out.addProperty("returned", blocks.size());
-        out.addProperty("truncated", truncated);
-        out.addProperty("dimension", dimension);
-        out.add("region", Json.GSON.toJsonTree(b));
+        out.addProperty("scanned", scanned);
+        out.addProperty("loaded", loaded);
+        out.addProperty("truncated", hasMore);
+        out.addProperty("hasMore", hasMore);
+        if (hasMore) {
+            JsonArray next = new JsonArray();
+            next.add(x);
+            next.add(y);
+            next.add(z);
+            out.add("nextCursor", next);
+        }
+        out.addProperty("dimension", level.dimension().location().toString());
+        out.add("region", Json.GSON.toJsonTree(box.toArray()));
+        out.addProperty("volume", box.volume() == Long.MAX_VALUE ? "overflow" : String.valueOf(box.volume()));
     }
 
     private void queryBuildStatus(String taskId, JsonObject out) {
@@ -1609,15 +2083,54 @@ public final class AgentManager {
     }
 
     /** 回读归档版本，客户端重启后用它恢复本地 VoxelWorld。 */
-    private void queryResume(String taskId, JsonObject out) {
+    private void queryResume(ServerPlayer player, String taskId, String payload, JsonObject out) {
         BuildMemory m = memories.get(taskId);
         if (m == null) {
             out.addProperty("error", "任务记忆不存在：" + taskId);
             return;
         }
+        JsonObject args = parseObject(payload);
+        BuildRegion region = m.region(Json.str(args, "regionId", m.activeRegionId));
+        Bounds filter = region == null ? m.activeRegion().bounds() : region.bounds();
         List<Placement> placements = loadPlacements(taskId, m.version);
+        List<Placement> matches = new ArrayList<>();
+        for (Placement placement : placements) {
+            if (filter != null && filter.contains(placement.x, placement.y, placement.z)) {
+                matches.add(placement);
+            }
+        }
+        // 归档为空时（例如修复前已建造、或方块直接写进世界但未归档）回退扫描真实世界，
+        // 让局部预览 / resume 对"已经造好的区域"依然可用。仅扫描已加载区块、限定体积避免卡顿。
+        if (matches.isEmpty() && filter != null && player != null) {
+            long volume = filter.volume();
+            if (volume > 0 && volume <= 2_000_000L) {
+                var level = player.serverLevel();
+                for (int x = filter.x1; x <= filter.x2; x++) {
+                    for (int z = filter.z1; z <= filter.z2; z++) {
+                        for (int y = filter.y1; y <= filter.y2; y++) {
+                            BlockPos pos = new BlockPos(x, y, z);
+                            if (!level.isLoaded(pos)) {
+                                continue;
+                            }
+                            var state = level.getBlockState(pos);
+                            if (state.isAir()) {
+                                continue;
+                            }
+                            String base = String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                                    .getKey(state.getBlock()));
+                            matches.add(new Placement(x, y, z, base, ""));
+                        }
+                    }
+                }
+            }
+        }
+        int offset = Math.max(0, Json.integer(args, "offset", 0));
+        int limit = Math.max(1, Math.min(8192, Json.integer(args, "limit", 4096)));
+        int start = Math.min(offset, matches.size());
+        int end = start + Math.min(limit, matches.size() - start);
         JsonArray blocks = new JsonArray();
-        for (Placement p : placements) {
+        for (int i = start; i < end; i++) {
+            Placement p = matches.get(i);
             JsonArray one = new JsonArray();
             one.add(p.x);
             one.add(p.y);
@@ -1629,8 +2142,13 @@ public final class AgentManager {
         out.add("blocks", blocks);
         out.addProperty("version", m.version);
         out.addProperty("count", blocks.size());
-        if (m.hasBounds && m.bounds != null) {
-            out.add("bounds", Json.GSON.toJsonTree(m.bounds.toArray()));
+        out.addProperty("total", matches.size());
+        out.addProperty("offset", start);
+        out.addProperty("nextOffset", end);
+        out.addProperty("hasMore", end < matches.size());
+        out.addProperty("regionId", region == null ? m.activeRegionId : region.id);
+        if (filter != null) {
+            out.add("bounds", Json.GSON.toJsonTree(filter.toArray()));
         }
     }
 
@@ -1690,16 +2208,25 @@ public final class AgentManager {
         if (m == null) {
             return;
         }
-        if (job.bounds != null) {
-            m.bounds = job.bounds.copy();
-            m.hasBounds = true;
-        }
         m.dimension = job.dimension;
+        // 归档：把本次实际写入的方块并入上一版本完整方块图。外部提交链路此前从不归档，
+        // 导致 resume / 物品 UI 局部预览 / 回滚 / 版本列表读到的方块图永远为空。
+        List<Placement> merged = mergePlacements(loadPlacements(job.taskId, m.version), job.committed);
         m.version++;
+        savePlacements(job.taskId, m.version, merged);
         m.status = "DONE";
-        m.stage = "外部 Agent 建造完成";
-        m.blocksPlacedTotal = job.written;
+        m.stage = "外部 Agent 提交完成";
+        m.blocksPlacedTotal += job.written;
         m.linkMode = "external";
+        BuildRegion region = m.region(job.regionId);
+        if (region != null) {
+            region.blocksPlaced += job.written;
+            if (!BuildRegion.DONE.equals(region.status)) {
+                region.status = BuildRegion.IN_PROGRESS;
+            }
+            region.touch();
+            m.stage = "已提交 · " + region.name;
+        }
         if (!job.summary.isBlank()) {
             m.notes = job.summary;
             m.addInstruction("外部 Agent", job.summary);
@@ -1718,6 +2245,12 @@ public final class AgentManager {
         if (job.vanished > 0) {
             report.append("，写入后消失 ").append(job.vanished).append(" 格");
         }
+        if (job.forbiddenSkipped > 0) {
+            report.append("，禁建区拦截 ").append(job.forbiddenSkipped).append(" 格");
+        }
+        if (job.outsideRegion > 0) {
+            report.append("，区域外拦截 ").append(job.outsideRegion).append(" 格");
+        }
         if (!job.pending.isEmpty()) {
             report.append("，仍有 ").append(job.pending.size()).append(" 格未写入");
         }
@@ -1729,6 +2262,32 @@ public final class AgentManager {
                             + "「状态解析失败 / 未写入」与首个方块示例");
         }
         pushState(m, false, null);
+    }
+
+    /** 把本次提交的方块并入上一版本方块图：同坐标覆盖，air 表示删除。结果按坐标去重。 */
+    private static List<Placement> mergePlacements(List<Placement> previous, List<CommitBlock> committed) {
+        Map<Long, Placement> map = new LinkedHashMap<>();
+        for (Placement p : previous) {
+            if (p == null) {
+                continue;
+            }
+            p.normalize();
+            map.put(p.key(), p);
+        }
+        for (CommitBlock c : committed) {
+            String full = c.fullState();
+            int bracket = full.indexOf('[');
+            String base = bracket > 0 ? full.substring(0, bracket) : full;
+            String state = bracket > 0 && full.endsWith("]")
+                    ? full.substring(bracket + 1, full.length() - 1) : "";
+            Placement p = new Placement(c.x(), c.y(), c.z(), base, state);
+            if ("minecraft:air".equals(base)) {
+                map.remove(p.key());
+            } else {
+                map.put(p.key(), p);
+            }
+        }
+        return new ArrayList<>(map.values());
     }
 
     private static net.minecraft.server.level.ServerLevel resolveAnyLevel(
@@ -1749,7 +2308,6 @@ public final class AgentManager {
             return;
         }
         tickCounter++;
-        mcpBridge.tick(currentServer);
         tickClientCommits(currentServer);
         Iterator<Map.Entry<String, AgentJob>> iterator = jobs.entrySet().iterator();
         while (iterator.hasNext()) {

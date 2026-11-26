@@ -4,17 +4,12 @@ import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 
-import com.mojang.brigadier.arguments.StringArgumentType;
-import com.mojang.brigadier.context.CommandContext;
-import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.logging.LogUtils;
 
 import baocup.builder.agent.AgentManager;
 import baocup.builder.net.ModPackets;
-import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.CreativeModeTabs;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -80,46 +75,20 @@ public class BuilderMod {
 
     private void addCreative(BuildCreativeModeTabContentsEvent event) {
         if (event.getTabKey() == CreativeModeTabs.TOOLS_AND_UTILITIES) {
-            event.accept(ModItems.BUILD_COMMANDER);
             event.accept(ModItems.EXTERNAL_BUILD_WAND);
         }
     }
 
-    /** /builder approve [taskId] | deny [taskId] | status：坐标授权只有玩家能批准。 */
+    /** /builder status：外部 Agent 只通过玩家客户端 MCP 建造。 */
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         event.getDispatcher().register(Commands.literal("builder")
-                .then(Commands.literal("approve")
-                        .executes(context -> approve(context, ""))
-                        .then(Commands.argument("taskId", StringArgumentType.string())
-                                .executes(context -> approve(context,
-                                        StringArgumentType.getString(context, "taskId")))))
-                .then(Commands.literal("deny")
-                        .executes(context -> deny(context, ""))
-                        .then(Commands.argument("taskId", StringArgumentType.string())
-                                .executes(context -> deny(context,
-                                        StringArgumentType.getString(context, "taskId")))))
                 .then(Commands.literal("status").executes(context -> {
-                    String message = AgentManager.get().mcpStatus();
-                    context.getSource().sendSuccess(() -> Component.literal(message), false);
+                    context.getSource().sendSuccess(() -> Component.literal(
+                            "§b[外部建造] §f请在客户端连接 MCP：http://127.0.0.1:"
+                                    + BuilderConfig.MCP_PORT.getAsInt() + "/mcp"), false);
                     return 1;
                 })));
-    }
-
-    private static int approve(CommandContext<CommandSourceStack> context, String taskId)
-            throws CommandSyntaxException {
-        ServerPlayer player = context.getSource().getPlayerOrException();
-        String message = AgentManager.get().approveBounds(player, taskId);
-        context.getSource().sendSuccess(() -> Component.literal("§a" + message), false);
-        return 1;
-    }
-
-    private static int deny(CommandContext<CommandSourceStack> context, String taskId)
-            throws CommandSyntaxException {
-        ServerPlayer player = context.getSource().getPlayerOrException();
-        String message = AgentManager.get().denyBounds(player, taskId);
-        context.getSource().sendSuccess(() -> Component.literal("§c" + message), false);
-        return 1;
     }
 
     @SubscribeEvent

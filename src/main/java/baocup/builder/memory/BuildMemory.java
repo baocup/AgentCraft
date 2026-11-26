@@ -25,11 +25,16 @@ public final class BuildMemory {
     public String dimension = "minecraft:overworld";
     public Bounds bounds;
     public boolean hasBounds;
+    /** 根区域与任意深度子区域；扁平存储避免巨大工程的递归序列化。 */
+    public List<BuildRegion> regions = new ArrayList<>();
+    /** 禁建区独立存在，不要求与根选区相交。 */
+    public List<ForbiddenZone> forbiddenZones = new ArrayList<>();
+    public String activeRegionId = BuildRegion.ROOT_ID;
 
     public String status = "IDLE";
     public String stage = "待命";
-    /** 该任务由哪个物品开启：internal = 游戏内 LLM Agent，external = 外部 Agent（MCP）。 */
-    public String linkMode = "internal";
+    /** 建造只由外部 Agent（MCP）驱动。 */
+    public String linkMode = "external";
     public String userBrief = "";
     public String notes = "";
 
@@ -161,6 +166,86 @@ public final class BuildMemory {
 
         public ZoneLine() {
         }
+    }
+
+    public void ensureRegions() {
+        linkMode = "external";
+        if (regions == null) {
+            regions = new ArrayList<>();
+        }
+        if (forbiddenZones == null) {
+            forbiddenZones = new ArrayList<>();
+        }
+        BuildRegion root = findRegionDirect(BuildRegion.ROOT_ID);
+        if (root == null) {
+            root = new BuildRegion(BuildRegion.ROOT_ID, "", "根建造区", bounds);
+            regions.add(0, root);
+        } else if (bounds != null) {
+            root.bounds = bounds.toArray();
+        }
+        if (findRegionDirect(activeRegionId) == null) {
+            activeRegionId = BuildRegion.ROOT_ID;
+        }
+    }
+
+    private BuildRegion findRegionDirect(String id) {
+        if (regions == null || id == null) {
+            return null;
+        }
+        for (BuildRegion region : regions) {
+            if (region != null && id.equals(region.id)) {
+                return region;
+            }
+        }
+        return null;
+    }
+
+    public BuildRegion region(String id) {
+        ensureRegions();
+        return findRegionDirect(id);
+    }
+
+    public BuildRegion rootRegion() {
+        ensureRegions();
+        return findRegionDirect(BuildRegion.ROOT_ID);
+    }
+
+    public BuildRegion activeRegion() {
+        ensureRegions();
+        BuildRegion active = findRegionDirect(activeRegionId);
+        return active == null ? rootRegion() : active;
+    }
+
+    public List<BuildRegion> safeRegions() {
+        ensureRegions();
+        return regions;
+    }
+
+    public List<ForbiddenZone> safeForbiddenZones() {
+        if (forbiddenZones == null) {
+            forbiddenZones = new ArrayList<>();
+        }
+        return forbiddenZones;
+    }
+
+    public ForbiddenZone forbiddenAt(int x, int y, int z) {
+        for (ForbiddenZone zone : safeForbiddenZones()) {
+            if (zone != null && zone.contains(x, y, z)) {
+                return zone;
+            }
+        }
+        return null;
+    }
+
+    public void resetRegions(Bounds rootBounds) {
+        bounds = rootBounds == null ? null : rootBounds.copy();
+        hasBounds = bounds != null;
+        regions = new ArrayList<>();
+        activeRegionId = BuildRegion.ROOT_ID;
+        BuildRegion root = new BuildRegion(BuildRegion.ROOT_ID, "", "根建造区", bounds);
+        root.status = BuildRegion.PLANNED;
+        regions.add(root);
+        touch();
     }
 
     public void touch() {

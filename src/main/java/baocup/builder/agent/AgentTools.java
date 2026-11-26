@@ -129,11 +129,11 @@ public final class AgentTools {
                       "replaceBlock":{"type":"string","description":"mode=replace 时只替换这个方块 id"},
                       "shell":{"type":"boolean","description":"只保留外表面，默认 false"},
                       "vars":{"type":"object",
-                        "description":"let 绑定：变量名 -> 数字或表达式，如 {\"H\":\"-52+grid(x,9)*3\"}；在 where 里直接引用 H，避免同一公式在墙/屋顶/窗里抄三遍"},
+                        "description":"let 绑定：变量名 -> 数字或表达式，如 {\\\"H\\\":\\\"-52+grid(x,9)*3\\\"}；在 where 里直接引用 H，避免同一公式在墙/屋顶/窗里抄三遍"},
                       "clone":{"type":"object",
-                        "description":"阵列：{\"offset\":[dx,dy,dz],\"count\":3}，把本次几何按偏移复制 count 份（含原来 1 份），最多 64 份"},
+                        "description":"阵列：{\\\"offset\\\":[dx,dy,dz],\\\"count\\\":3}，把本次几何按偏移复制 count 份（含原来 1 份），最多 64 份"},
                       "mirror":{"type":"object",
-                        "description":"镜像：{\"axis\":\"x\"|\"y\"|\"z\",\"at\":坐标}，把本次几何沿该轴镜像一份；可与 clone 叠加"},
+                        "description":"镜像：{\\\"axis\\\":\\\"x\\\"|\\\"y\\\"|\\\"z\\\",\\\"at\\\":坐标}，把本次几何沿该轴镜像一份；可与 clone 叠加"},
                       "state":{"type":"string","description":"可选 BlockState 属性串"}
                     },"required":["region","block"]}
                     """),

@@ -1,5 +1,4 @@
 {
-  "item.builder.build_commander": "Build Commander",
   "item.builder.external_build_wand": "External Build Wand",
-  "builder.gui.title": "Build Commander - Agent"
+  "builder.gui.title": "External Build Wand"
 }

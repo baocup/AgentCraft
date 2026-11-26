@@ -86,32 +86,77 @@ public final class Bounds {
         return z2;
     }
 
+    public long sizeXLong() {
+        return (long) x2 - x1 + 1;
+    }
+
+    public long sizeYLong() {
+        return (long) y2 - y1 + 1;
+    }
+
+    public long sizeZLong() {
+        return (long) z2 - z1 + 1;
+    }
+
     public int sizeX() {
-        return x2 - x1 + 1;
+        return saturatedSize(sizeXLong());
     }
 
     public int sizeY() {
-        return y2 - y1 + 1;
+        return saturatedSize(sizeYLong());
     }
 
     public int sizeZ() {
-        return z2 - z1 + 1;
+        return saturatedSize(sizeZLong());
     }
 
+    /** 超大选区只用于空间约束，绝不据此分配数组；溢出时饱和而不是变成负数。 */
     public long volume() {
-        return (long) sizeX() * sizeY() * sizeZ();
+        long x = sizeXLong();
+        long y = sizeYLong();
+        long z = sizeZLong();
+        if (x <= 0 || y <= 0 || z <= 0) {
+            return 0;
+        }
+        if (x > Long.MAX_VALUE / y) {
+            return Long.MAX_VALUE;
+        }
+        long xy = x * y;
+        return xy > Long.MAX_VALUE / z ? Long.MAX_VALUE : xy * z;
+    }
+
+    private static int saturatedSize(long size) {
+        return size <= 0 ? 0 : size > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) size;
     }
 
     public boolean contains(int x, int y, int z) {
         return x >= x1 && x <= x2 && y >= y1 && y <= y2 && z >= z1 && z <= z2;
     }
 
+    public boolean contains(Bounds other) {
+        return other != null && contains(other.x1, other.y1, other.z1)
+                && contains(other.x2, other.y2, other.z2);
+    }
+
+    public boolean intersects(Bounds other) {
+        return other != null && x1 <= other.x2 && x2 >= other.x1
+                && y1 <= other.y2 && y2 >= other.y1 && z1 <= other.z2 && z2 >= other.z1;
+    }
+
+    public Bounds intersection(Bounds other) {
+        if (!intersects(other)) {
+            return null;
+        }
+        return new Bounds(Math.max(x1, other.x1), Math.max(y1, other.y1), Math.max(z1, other.z1),
+                Math.min(x2, other.x2), Math.min(y2, other.y2), Math.min(z2, other.z2));
+    }
+
     /** 把任意长方体裁剪进选区；完全在选区外时返回 null。 */
     public int[] clamp(int ax1, int ay1, int az1, int ax2, int ay2, int az2) {
         int loX = Math.max(x1, Math.min(ax1, ax2));
         int hiX = Math.min(x2, Math.max(ax1, ax2));
-        int loY = Math.max(Math.max(y1, -64), Math.min(ay1, ay2));
-        int hiY = Math.min(Math.min(y2, 319), Math.max(ay1, ay2));
+        int loY = Math.max(y1, Math.min(ay1, ay2));
+        int hiY = Math.min(y2, Math.max(ay1, ay2));
         int loZ = Math.max(z1, Math.min(az1, az2));
         int hiZ = Math.min(z2, Math.max(az1, az2));
         if (loX > hiX || loY > hiY || loZ > hiZ) {
@@ -121,11 +166,11 @@ public final class Bounds {
     }
 
     public BlockPos center() {
-        return new BlockPos((x1 + x2) / 2, y1, (z1 + z2) / 2);
+        return new BlockPos((int) (((long) x1 + x2) / 2), y1, (int) (((long) z1 + z2) / 2));
     }
 
     public String display() {
         return "(" + x1 + "," + y1 + "," + z1 + ") -> (" + x2 + "," + y2 + "," + z2 + ")  "
-                + sizeX() + "x" + sizeY() + "x" + sizeZ();
+                + sizeXLong() + "x" + sizeYLong() + "x" + sizeZLong();
     }
 }

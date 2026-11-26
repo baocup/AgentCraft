@@ -1,741 +1,378 @@
 package baocup.builder.client;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.function.Consumer;
-
+import baocup.builder.net.ModPackets;
+import baocup.builder.util.Bounds;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-
-import baocup.builder.net.ModPackets;
-import baocup.builder.util.Json;
+import com.mojang.blaze3d.platform.NativeImage;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.neoforged.neoforge.network.PacketDistributor;
 
-/** 建造指令物品的完整 GUI：坐标、指令、Agent 输出、Plan 对话、结构化记忆、视觉检查。 */
-public final class BuilderScreen extends Screen {
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+
+/** 外部建造手杖控制台：概览 / 区域 / 禁建区 / 日志。 */
+public class BuilderScreen extends Screen {
+    private enum Tab { OVERVIEW("概览"), REGIONS("区域"), FORBIDDEN("禁建区"), LOGS("日志");
+        final String label; Tab(String s) { label = s; } }
+    private static final int ROW = 46, LOG = 12;
+    private static final String[] FL = {"X1", "Y1", "Z1", "X2", "Y2", "Z2"};
     public final String taskId;
-
-    private static final int BG = 0xF0121722;
-    private static final int PANEL = 0xE0202836;
-    private static final int BORDER = 0xFF4A637E;
-    private static final int TEXT = 0xFFE6ECF2;
-    private static final int MUTED = 0xFF9BA9B8;
-    private static final int ACCENT = 0xFF63C6E8;
-    private static final int LINE_H = 11;
-
     private ClientState state;
-    private int tab;
-
-    private int left, top, widthPx, heightPx;
-    private int leftX, leftW, rightX, rightW, contentTop, bottom;
-    private int panelX, panelY, panelW, panelH;
-
-    private final String[] coordText = { "", "", "", "", "", "" };
-    private final EditBox[] coordBoxes = new EditBox[6];
-    private boolean coordsEdited;
-    private boolean suppressResponder;
-    private String commandText = "";
-    private String chatText = "";
-
-    private EditBox commandBox;
-    private EditBox chatBox;
-    private EditBox poseBox;
-    private Button buildButton, planButton, stopButton;
-    private Button sendButton, confirmButton, planEnterButton, planExitButton;
-    private final Button[] tabButtons = new Button[5];
-
-    private int logScroll, chatScroll, infoScroll, planScroll, visualScroll;
-    private boolean followLog = true, followChat = true, followVisual = true;
-    private String poseText = "";
-    private final List<Line> logLines = new ArrayList<>();
-    private final List<Line> chatLines = new ArrayList<>();
-    private final List<Line> infoLines = new ArrayList<>();
-    private final List<Line> planLines = new ArrayList<>();
-    private final List<Line> visualLines = new ArrayList<>();
-    private boolean linesDirty = true;
+    private Tab tab = Tab.OVERVIEW;
+    private final EditBox[] fields = new EditBox[6];
+    private int rScroll, fScroll, lScroll;
+    private boolean autoLog = true;
+    private String delKind = "", delId = "", formMsg = "", previewMsg = "尚未生成局部预览", scanMsg = "";
+    private long delUntil;
+    private boolean loading;
+    private ResourceLocation tex;
+    private DynamicTexture dyn;
+    private int pw, ph, px, py, pW, pH, cx, cy, cw, ch, ly, lh, fy, by, ty, vy, vh;
 
     public BuilderScreen(ClientState state) {
-        super(Component.literal("建造指令 · Agent"));
-        this.taskId = state.taskId == null ? "" : state.taskId;
+        super(Component.literal("外部建造手杖"));
         this.state = state;
+        this.taskId = state == null ? "" : state.taskId;
+    }
+
+    public void applyState(ClientState s) {
+        state = s;
+        if (s == null) return;
+        Bounds b = s.rootBounds();
+        if (b != null) {
+            int[] v = b.toArray();
+            for (int i = 0; i < 6; i++) if (fields[i] != null && !fields[i].isFocused()) fields[i].setValue(Integer.toString(v[i]));
+        }
+        if (autoLog) lScroll = Math.max(0, s.safeLogs().size() * LOG - lh);
+    }
+
+    @Override protected void init() {
+        super.init();
+        layout();
+        clearWidgets();
+        int gap = 4, tw = (cw - gap * 3) / 4;
+        for (int i = 0; i < Tab.values().length; i++) {
+            Tab t = Tab.values()[i];
+            addRenderableWidget(Button.builder(Component.literal((t == tab ? "● " : "") + t.label), b -> switchTab(t))
+                    .bounds(cx + i * (tw + gap), py + 28, tw, 20).build());
+        }
+        int footY = py + pH - 26;
+        addRenderableWidget(Button.builder(Component.literal("刷新"), b -> PacketDistributor.sendToServer(new ModPackets.C2SAction(taskId, "sync", "{}"))).bounds(cx, footY, 80, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("关闭"), b -> onClose()).bounds(cx + cw - 80, footY, 80, 20).build());
+        if (tab == Tab.OVERVIEW) overviewWidgets();
+        else if (tab == Tab.FORBIDDEN) addRenderableWidget(Button.builder(Component.literal("两点新增禁建区"), b -> mode("FORBIDDEN_ZONE")).bounds(cx + cw - 120, cy - 2, 120, 18).build());
+        else if (tab == Tab.LOGS) {
+            addRenderableWidget(Button.builder(Component.literal(autoLog ? "自动滚动：开" : "自动滚动：关"), b -> {
+                autoLog = !autoLog; b.setMessage(Component.literal(autoLog ? "自动滚动：开" : "自动滚动：关"));
+                if (autoLog && state != null) lScroll = Math.max(0, state.safeLogs().size() * LOG - lh);
+            }).bounds(cx + cw - 180, cy - 2, 90, 18).build());
+            addRenderableWidget(Button.builder(Component.literal("清空日志"), b -> PacketDistributor.sendToServer(new ModPackets.C2SAction(taskId, "clear_logs", "{}"))).bounds(cx + cw - 84, cy - 2, 84, 18).build());
+        }
+    }
+
+    private void layout() {
+        pW = Math.min(width - 16, 760); pH = Math.min(height - 16, 460);
+        px = (width - pW) / 2; py = (height - pH) / 2;
+        cx = px + 12; cy = py + 56; cw = pW - 24; ch = pH - 92;
+        ly = cy + 24; lh = Math.max(40, ch - 24);
+        fy = cy + 84; by = fy + 24; ty = by + 26; vy = ty + 24; vh = Math.max(40, cy + ch - vy - 16);
+    }
+
+    private void overviewWidgets() {
+        int fw = (cw - 30) / 6;
+        Bounds root = state == null ? null : state.rootBounds();
+        int[] v = root == null ? new int[6] : root.toArray();
         for (int i = 0; i < 6; i++) {
-            coordText[i] = state.bounds != null && state.bounds.length == 6
-                    ? String.valueOf(state.bounds[i]) : "0";
+            EditBox e = new EditBox(font, cx + i * (fw + 6), fy, fw, 18, Component.literal(FL[i]));
+            e.setMaxLength(12); e.setValue(Integer.toString(v[i])); fields[i] = e; addRenderableWidget(e);
         }
-        commandText = "";
-        send("sync", "{}");
+        int bw = (cw - 18) / 4;
+        addRenderableWidget(Button.builder(Component.literal("应用坐标"), b -> applyBounds()).bounds(cx, by, bw, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("选根区"), b -> mode("ROOT")).bounds(cx + bw + 6, by, bw, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("选子区"), b -> mode("CHILD_REGION")).bounds(cx + 2 * (bw + 6), by, bw, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("选禁建区"), b -> mode("FORBIDDEN_ZONE")).bounds(cx + 3 * (bw + 6), by, bw, 20).build());
+        int tw = (cw - 12) / 3;
+        addRenderableWidget(Button.builder(Component.literal("预览当前区域"), b -> preview()).bounds(cx, ty, tw, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("检测当前区域"), b -> scan(false)).bounds(cx + tw + 6, ty, tw, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("检测根区首页"), b -> scan(true)).bounds(cx + 2 * (tw + 6), ty, tw, 20).build());
     }
 
-    private record Line(String text, int color) {
+    private void switchTab(Tab t) { if (tab != t) { tab = t; delKind = ""; delId = ""; init(); } }
+    private void mode(String m) { mode(m, null); }
+    private void mode(String m, String parentId) {
+        JsonObject d = new JsonObject(); d.addProperty("mode", m);
+        if (parentId != null) d.addProperty("parentId", parentId);
+        send("selection_mode", d); onClose();
+    }
+    private void send(String a, JsonObject d) { PacketDistributor.sendToServer(new ModPackets.C2SAction(taskId, a, d.toString())); }
+    private void applyBounds() {
+        JsonArray arr = new JsonArray();
+        try { for (EditBox e : fields) arr.add(Integer.parseInt(e.getValue().trim())); }
+        catch (Exception ex) { formMsg = "坐标必须是 6 个整数"; return; }
+        JsonObject d = new JsonObject(); d.add("bounds", arr); send("bounds", d); formMsg = "已发送根区坐标更新";
     }
 
-    @Override
-    public boolean isPauseScreen() {
-        // 不能暂停：暂停会让单机的服务端 tick 停下来，Agent 就无法继续放置方块
-        return false;
+    private void preview() {
+        loading = true; previewMsg = "正在生成局部预览…";
+        ClientBuildHost.INSTANCE.previewActiveRegion("ortho", r -> Minecraft.getInstance().execute(() -> {
+            loading = false;
+            if (r.has("error")) { previewMsg = r.get("error").getAsString(); return; }
+            JsonArray p = r.has("photoPaths") ? r.getAsJsonArray("photoPaths") : null;
+            if (p == null || p.isEmpty()) { previewMsg = "预览已生成，但没有返回图片路径"; return; }
+            loadPreview(p.get(0).getAsString());
+        }));
     }
 
-    /** 外部 Agent 物品只展示 MCP 动作日志，不提供游戏内模型的建造入口。 */
-    private boolean externalMode() {
-        return state != null && "external".equals(state.mode);
+    private void loadPreview(String path) {
+        closePreview();
+        try (InputStream in = Files.newInputStream(Path.of(path))) {
+            NativeImage img = NativeImage.read(in);
+            pw = img.getWidth(); ph = img.getHeight();
+            dyn = new DynamicTexture(img);
+            tex = ResourceLocation.fromNamespaceAndPath("builder", "preview/" + san(taskId) + "/" + san(state == null ? "root" : state.activeRegionId));
+            Minecraft.getInstance().getTextureManager().register(tex, dyn);
+            previewMsg = "预览：" + Path.of(path).getFileName();
+        } catch (Exception e) { previewMsg = "预览加载失败：" + e.getMessage(); }
     }
 
-    @Override
-    protected void init() {
-        if (externalMode()) {
-            // 外部物品只保留「Agent 输出」：建造页不再构建，左侧坐标框仍可手动改范围
-            tab = 1;
-        }
-        widthPx = Math.min(this.width - 16, 820);
-        heightPx = Math.min(this.height - 16, 480);
-        left = (this.width - widthPx) / 2;
-        top = (this.height - heightPx) / 2;
-        leftX = left + 8;
-        leftW = 196;
-        rightX = leftX + leftW + 8;
-        rightW = widthPx - (rightX - left) - 8;
-        contentTop = top + 52;
-        bottom = top + heightPx - 8;
-
-        buildLeftPanel();
-        buildTabs();
-        buildTabContent();
-        refreshButtons();
-        if (externalMode()) {
-            // 外部任务的决策者是外部 Agent：坐标仍可手动输入，但游戏内模型的入口没有意义
-            if (planButton != null) {
-                planButton.visible = false;
-                planButton.active = false;
-            }
-            if (buildButton != null) {
-                buildButton.active = false;
-            }
-        }
-        rebuildLines();
+    private void closePreview() {
+        if (dyn != null) { dyn.close(); dyn = null; }
+        if (tex != null) { Minecraft.getInstance().getTextureManager().release(tex); tex = null; }
     }
 
-    private void buildLeftPanel() {
-        int y = top + 30;
-        int boxW = (leftW - 12) / 3;
-        for (int row = 0; row < 2; row++) {
-            for (int col = 0; col < 3; col++) {
-                int index = row * 3 + col;
-                coordBoxes[index] = addEdit(leftX + col * (boxW + 4), y + 22 + row * 36, boxW, 18,
-                        "XYZ".substring(col, col + 1), 10, coordText[index], value -> {
-                            if (!suppressResponder) {
-                                coordText[index] = value;
-                                coordsEdited = true;
-                            }
-                        });
-            }
-        }
-        addButton("应用坐标", leftX, y + 96, leftW, 20, this::applyBounds);
-        // 外部 Agent 由客户端 MCP 驱动，没有"进行中的游戏内任务"，不需要中止按钮
-        if (externalMode()) {
-            addButton("刷新状态", leftX, bottom - 42, leftW, 20, () -> send("sync", "{}"));
-        } else {
-            addButton("刷新状态", leftX, bottom - 42, (leftW - 4) / 2, 20, () -> send("sync", "{}"));
-            addButton("中止任务", leftX + (leftW + 4) / 2, bottom - 42, (leftW - 4) / 2, 20,
-                    () -> send("stop", "{}"));
-        }
+    private static String san(String s) {
+        String l = s == null ? "unknown" : s.toLowerCase(Locale.ROOT);
+        StringBuilder o = new StringBuilder();
+        for (char c : l.toCharArray()) o.append((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '/' || c == '.' || c == '_' || c == '-' ? c : '_');
+        return o.isEmpty() ? "unknown" : o.toString();
     }
 
-    private void buildTabs() {
-        String[] labels = { "建造", "Agent 输出", "Plan 对话", "记忆", "视觉检查" };
-        int gap = 4;
-        int w = (rightW - gap * 4) / 5;
-        for (int i = 0; i < tabButtons.length; i++) {
-            final int target = i;
-            tabButtons[i] = addButton(labels[i], rightX + i * (w + gap), top + 28, w, 20, () -> {
-                tab = target;
-                rebuildWidgets();
-            });
-            // 外部 Agent 物品只有「Agent 输出」一页，切换按钮全部隐藏
-            if (externalMode()) {
-                tabButtons[i].visible = false;
-                tabButtons[i].active = false;
-            }
-        }
+    private void scan(boolean root) {
+        scanMsg = root ? "正在检测根区首页…" : "正在检测当前区域…";
+        ClientBuildHost.INSTANCE.scanActiveRegion(root).whenComplete((r, e) -> Minecraft.getInstance().execute(() -> {
+            if (e != null) scanMsg = "检测失败：" + e.getMessage();
+            else if (r.has("error")) scanMsg = r.get("error").getAsString();
+            else scanMsg = "返回 " + iv(r, "returned") + " / 扫描 " + iv(r, "scanned") + " / 已加载 " + iv(r, "loaded")
+                    + (r.has("hasMore") && r.get("hasMore").getAsBoolean() ? " · 还有更多" : " · 首页完成");
+        }));
     }
+    private static int iv(JsonObject o, String k) { return o.has(k) && o.get(k).isJsonPrimitive() ? o.get(k).getAsInt() : 0; }
 
-    private void buildTabContent() {
-        panelX = rightX + 2;
-        panelW = rightW - 4;
+    @Override public void render(GuiGraphics g, int mx, int my, float pt) {
+        // super.render 内部会调 renderBackground（含模糊后处理）再画控件；
+        // 这里不能再额外调一次 renderBackground，否则模糊会把先画的文字盖住。
+        super.render(g, mx, my, pt);
+        g.drawString(font, "外部建造手杖", px + 12, py + 10, 0xFFFFFF);
+        String right = shortId() + " · v" + (state == null ? 0 : state.version);
+        g.drawString(font, right, px + pW - 12 - font.width(right), py + 10, 0x9AA7B4);
         switch (tab) {
-            case 0 -> {
-                commandBox = addEdit(rightX, contentTop + 14, rightW, 20, "建造指令", 512, commandText,
-                        value -> commandText = value);
-                int gap = 4;
-                int bw = (rightW - gap * 2) / 3;
-                buildButton = addButton("开始建造", rightX, contentTop + 40, bw, 20, this::build);
-                planButton = addButton("进入 Plan 模式", rightX + (bw + gap), contentTop + 40, bw, 20,
-                        () -> {
-                            send("plan_open", "{}");
-                            tab = 2;
-                            rebuildWidgets();
-                        });
-                stopButton = addButton("中止", rightX + 2 * (bw + gap), contentTop + 40, bw, 20,
-                        () -> send("stop", "{}"));
-                panelY = contentTop + 78;
-                panelH = bottom - panelY - 4;
-            }
-            case 1 -> {
-                panelY = contentTop + 14;
-                panelH = bottom - panelY - 28;
-                addButton("跟随最新", rightX, bottom - 20, (rightW - 8) / 2, 20, () -> {
-                    followLog = true;
-                    logScroll = maxScroll(logLines.size(), panelH);
-                });
-                addButton("回到顶部", rightX + (rightW - 8) / 2 + 8, bottom - 20, (rightW - 8) / 2, 20,
-                        () -> {
-                            followLog = false;
-                            logScroll = 0;
-                        });
-            }
-            case 2 -> {
-                panelY = contentTop + 14;
-                int chatY = bottom - 64;
-                panelH = chatY - panelY - 6;
-                chatBox = addEdit(rightX, chatY, rightW - 96, 20, "Plan 对话", 512, chatText,
-                        value -> chatText = value);
-                sendButton = addButton("发送", rightX + rightW - 90, chatY, 90, 20, this::sendChat);
-                int gap = 4;
-                int bw = (rightW - gap * 2) / 3;
-                confirmButton = addButton("按计划建造", rightX, chatY + 24, bw, 20, this::confirmPlan);
-                planExitButton = addButton("退出 Plan", rightX + bw + gap, chatY + 24, bw, 20,
-                        () -> send("plan_exit", "{}"));
-                planEnterButton = addButton("进入 Plan", rightX + 2 * (bw + gap), chatY + 24, bw, 20,
-                        () -> send("plan_open", "{}"));
-            }
-            case 3 -> {
-                panelY = contentTop + 14;
-                panelH = bottom - panelY - 28;
-                addButton("回到建造页", rightX, bottom - 20, rightW, 20, () -> {
-                    tab = 0;
-                    rebuildWidgets();
-                });
-            }
-            case 4 -> {
-                panelY = contentTop + 14;
-                int poseY = bottom - 68;
-                panelH = poseY - panelY - 6;
-                poseBox = addEdit(rightX, poseY, rightW - 128, 20,
-                        "自定义视角 x,y,z,yaw,pitch", 160, poseText, value -> poseText = value);
-                addButton("自定义视角", rightX + rightW - 122, poseY, 122, 20, this::sendCustomPose);
-                int gap = 4;
-                int bw = (rightW - gap * 2) / 3;
-                addButton("拍照检查", rightX, poseY + 24, bw, 20, () -> send("visual_capture", "{}"));
-                addButton("AI 自由查看", rightX + bw + gap, poseY + 24, bw, 20,
-                        () -> send("visual_analyze", "{}"));
-                addButton("回到建造页", rightX + 2 * (bw + gap), poseY + 24, bw, 20, () -> {
-                    tab = 0;
-                    rebuildWidgets();
-                });
-            }
-            default -> {
-                panelY = contentTop + 14;
-                panelH = bottom - panelY - 28;
-            }
+            case OVERVIEW -> overview(g, mx, my);
+            case REGIONS -> regions(g, mx, my);
+            case FORBIDDEN -> forbidden(g, mx, my);
+            case LOGS -> logs(g);
         }
     }
 
-    private EditBox addEdit(int x, int y, int w, int h, String label, int maxLength,
-                            String value, Consumer<String> responder) {
-        EditBox box = new EditBox(this.font, x, y, w, h, Component.literal(label));
-        box.setMaxLength(maxLength);
-        box.setValue(value == null ? "" : value);
-        box.setResponder(responder);
-        box.setHint(Component.literal(label));
-        this.addRenderableWidget(box);
-        return box;
+    @Override public void renderBackground(GuiGraphics g, int mx, int my, float pt) {
+        super.renderBackground(g, mx, my, pt);
+        g.fill(px, py, px + pW, py + pH, 0xF0101418);
+        g.fill(px, py, px + pW, py + 1, 0xFF3A4A5A);
+        g.fill(px, py + pH - 1, px + pW, py + pH, 0xFF3A4A5A);
+        g.fill(px, py, px + 1, py + pH, 0xFF3A4A5A);
+        g.fill(px + pW - 1, py, px + pW, py + pH, 0xFF3A4A5A);
     }
 
-    private Button addButton(String label, int x, int y, int w, int h, Runnable action) {
-        Button button = Button.builder(Component.literal(label), b -> action.run()).bounds(x, y, w, h).build();
-        this.addRenderableWidget(button);
-        return button;
-    }
-
-    // ------------------------------------------------------------------
-    // 状态同步
-    // ------------------------------------------------------------------
-
-    public void applyState(ClientState snapshot) {
-        this.state = snapshot;
-        if (!coordsEdited && snapshot.bounds != null && snapshot.bounds.length == 6) {
-            for (int i = 0; i < 6; i++) {
-                coordText[i] = String.valueOf(snapshot.bounds[i]);
-                if (coordBoxes[i] != null) {
-                    suppressResponder = true;
-                    coordBoxes[i].setValue(coordText[i]);
-                    suppressResponder = false;
-                }
-            }
-        }
-        linesDirty = true;
-        rebuildLines();
-        refreshButtons();
-    }
-
-    private void refreshButtons() {
-        for (int i = 0; i < tabButtons.length; i++) {
-            if (tabButtons[i] != null) {
-                tabButtons[i].active = i != tab;
-            }
-        }
-        boolean busy = state != null && "BUILDING".equals(state.status);
-        boolean built = state != null && state.hasBuilt;
-        if (buildButton != null) {
-            buildButton.active = !busy;
-            buildButton.setMessage(Component.literal(built ? "修改建筑" : "开始建造"));
-        }
-        if (stopButton != null) stopButton.active = busy;
-        if (planButton != null) planButton.active = !busy;
-        if (confirmButton != null) confirmButton.active = !busy && state != null && state.planReady;
-        if (planExitButton != null) planExitButton.active = state != null && state.planMode;
-        if (planEnterButton != null) planEnterButton.active = state == null || !state.planMode;
-    }
-
-    private void rebuildLines() {
-        if (this.font == null) {
-            linesDirty = true;
-            return;
-        }
-        linesDirty = false;
-        logLines.clear();
-        chatLines.clear();
-        infoLines.clear();
-        planLines.clear();
-        visualLines.clear();
-        if (state == null) {
-            return;
-        }
-        int wrapWidth = Math.max(60, panelW - 14);
-        // 外部 Agent 的物品只看本地 MCP 的动作日志（服务端不再驱动这条链路）
-        java.util.List<ClientState.LogItem> source = externalMode()
-                ? ClientBuildHost.INSTANCE.snapshotLogs(state.taskId) : state.safeLogs();
-        for (ClientState.LogItem item : source) {
-            int color = switch (state.safe(item.level)) {
-                case "WARN" -> 0xFFFFCC66;
-                case "ERROR" -> 0xFFFF7777;
-                default -> "思考".equals(item.stage) ? 0xFFC3A6F0 : TEXT;
-            };
-            String prefix = "[" + state.safe(item.stage) + "] ";
-            for (String s : wrap(prefix + state.safe(item.text), wrapWidth)) {
-                logLines.add(new Line(s, color));
-            }
-        }
-        for (ClientState.ChatItem item : state.safeChat()) {
-            boolean user = "user".equals(item.role);
-            String prefix = user ? "你： " : "Agent： ";
-            int color = user ? ACCENT : TEXT;
-            for (String s : wrap(prefix + state.safe(item.text), wrapWidth)) {
-                chatLines.add(new Line(s, color));
-            }
-        }
-        for (String s : wrap(state.safe(state.planText), wrapWidth)) {
-            planLines.add(new Line(s, TEXT));
-        }
-        int warnColor = 0xFFFFCC66;
-        int okColor = 0xFF8FD6A0;
-        infoLines.add(new Line("任务指针 " + state.safe(state.taskId), MUTED));
-        infoLines.add(new Line("拥有者 " + state.safe(state.owner) + "   维度 " + state.safe(state.dimension), MUTED));
-        infoLines.add(new Line("最近目标 " + state.safe(state.userBrief), TEXT));
-        infoLines.add(new Line("—— 结构化事实层（AI 修改建筑时以此为准）——", ACCENT));
-        String factSummary = state.safe(state.factSummary);
-        if (factSummary.isBlank()) {
-            infoLines.add(new Line("  尚未抽取，完成任一施工阶段后自动生成（0 额外 token）", MUTED));
+    private void overview(GuiGraphics g, int mx, int my) {
+        ClientState.RegionItem a = state == null ? null : state.activeRegion();
+        Bounds ab = state == null ? null : state.activeBounds();
+        g.fill(cx, cy, cx + cw, cy + 54, 0x20182028);
+        if (a == null) {
+            g.drawString(font, "尚未选择建造区", cx + 8, cy + 8, 0xFFAA00);
+            g.drawString(font, fit("默认不选点；点「选根区/选子区/选禁建区」武装后左键两点，完成即自动退出。", cw - 16), cx + 8, cy + 24, 0xB8C4D0);
         } else {
-            for (String line : wrap(factSummary, wrapWidth)) {
-                infoLines.add(new Line("  " + line, TEXT));
-            }
+            g.drawString(font, fit(a.name, cw - 160), cx + 8, cy + 6, 0xFFFFFF);
+            g.drawString(font, status(a.status) + " · 进度 " + a.progress + "% · 已放置 " + a.blocksPlaced, cx + 8, cy + 20, 0xB8C4D0);
+            g.drawString(font, ab == null ? "无边界" : fit(ab.display(), cw - 16), cx + 8, cy + 34, 0x8FA0B0);
+            g.drawString(font, fit("聚焦：" + a.id, 140), cx + cw - 148, cy + 6, 0x6FC3FF);
         }
-        infoLines.add(new Line("  楼层 " + state.safeFactLevels().size() + " / 区域 "
-                + state.safeFactRooms().size() + " / 构件 " + state.safeFactFeatures().size()
-                + "，坐标索引 " + state.factIndexSize + " 格，实体 " + state.entityCount + " 个", MUTED));
-        infoLines.add(new Line("—— 楼层 ——", ACCENT));
-        for (ClientState.FactLevel level : state.safeFactLevels()) {
-            infoLines.add(new Line("  第 " + (level.index + 1) + " 层 y=" + level.yMin + "~"
-                    + level.yMax + "，" + level.blocks + " 格，主材 "
-                    + state.safe(level.dominantMaterial), MUTED));
-        }
-        infoLines.add(new Line("—— 房间 ——", ACCENT));
-        if (state.safeFactRooms().isEmpty()) {
-            infoLines.add(new Line("  （无）", MUTED));
-        }
-        for (ClientState.FactRoom room : state.safeFactRooms()) {
-            infoLines.add(new Line("  " + room.id + " 「" + state.safe(room.name) + "」 用途="
-                    + state.safe(room.purpose) + " 地板=" + room.floorCount
-                    + " 墙=" + room.wallCount + " " + state.safe(room.box), TEXT));
-        }
-        infoLines.add(new Line("—— 构件树 ——", ACCENT));
-        for (ClientState.FactFeature feature : state.safeFactFeatures()) {
-            infoLines.add(new Line("  " + feature.id + " [" + feature.kind + "] "
-                    + state.safe(feature.name) + " " + state.safe(feature.material).replace("minecraft:", "")
-                    + " 朝向=" + state.safe(feature.facing) + " " + state.safe(feature.state), MUTED));
-        }
-        infoLines.add(new Line("—— LLM 语义层 ——", ACCENT));
-        String semanticSummary = state.safe(state.semanticSummary);
-        if (semanticSummary.isBlank()) {
-            infoLines.add(new Line("  （离线模式或尚未生成）", MUTED));
-        } else {
-            for (String line : wrap(semanticSummary, wrapWidth)) {
-                infoLines.add(new Line("  " + line, TEXT));
-            }
-        }
-        for (ClientState.SemanticRoom room : state.safeSemanticRooms()) {
-            infoLines.add(new Line("  " + room.roomId + " 「" + state.safe(room.name) + "」 用途="
-                    + state.safe(room.purpose) + " 氛围=" + state.safe(room.mood), MUTED));
-        }
-        infoLines.add(new Line("—— 双写互校（事实层为准）——", ACCENT));
-        boolean hasDifference = state.crossFactOnly > 0 || state.crossSemanticOnly > 0
-                || state.crossConflicts > 0;
-        if (state.safe(state.crossVerdict).isBlank()) {
-            infoLines.add(new Line("  （尚未互校）", MUTED));
-        } else {
-            infoLines.add(new Line("  " + state.crossVerdict + "：事实独有 " + state.crossFactOnly
-                    + " / 语义独有 " + state.crossSemanticOnly + " / 属性冲突 "
-                    + state.crossConflicts, hasDifference ? warnColor : okColor));
-        }
-        for (String issue : state.safeCrossIssues()) {
-            infoLines.add(new Line("  · " + issue, warnColor));
-        }
-        infoLines.add(new Line("—— 版本历史 ——", ACCENT));
-        for (ClientState.VersionItem v : state.safeVersions()) {
-            infoLines.add(new Line("v" + v.version + "  " + state.safe(v.instruction)
-                    + "  " + v.blocks + " 方块", TEXT));
-        }
-        infoLines.add(new Line("—— 意图层区域（zone） ——", ACCENT));
-        for (ClientState.ZoneItem z : state.safeZones()) {
-            infoLines.add(new Line(z.id + " [" + z.op + "] " + z.name + " " + z.shape
-                    + " " + z.box + " " + z.material, MUTED));
-        }
-        infoLines.add(new Line("—— 材质用量 ——", ACCENT));
-        for (Map.Entry<String, Integer> e : state.safeMaterials().entrySet()) {
-            infoLines.add(new Line(e.getKey() + " × " + e.getValue(), MUTED));
-        }
-        // 视觉检查页：相机清单、照片、AI 审查报告与发现的问题
-        visualLines.add(new Line("独立虚拟相机（非玩家截图）· 离屏光线投射渲染", ACCENT));
-        visualLines.add(new Line("世界中相机标记 " + state.cameraCount + " 个 · 照片 "
-                + state.safeCaptures().size() + " 张", MUTED));
-        visualLines.add(new Line("—— 照片清单 ——", ACCENT));
-        if (state.safeCaptures().isEmpty()) {
-            visualLines.add(new Line("  还没有照片，点击「拍照检查」或「AI 自由查看」", MUTED));
-        }
-        for (ClientState.CaptureItem capture : state.safeCaptures()) {
-            visualLines.add(new Line("  " + capture.name + " [" + capture.id + "] "
-                    + capture.width + "×" + capture.height
-                    + " 建筑像素=" + capture.blockPixels, TEXT));
-            for (String line : wrap("  机位 " + state.safe(capture.pose), wrapWidth)) {
-                visualLines.add(new Line(line, MUTED));
-            }
-            for (String line : wrap("  命中材质 " + state.safe(capture.materials), wrapWidth)) {
-                visualLines.add(new Line(line, MUTED));
-            }
-            for (String line : wrap("  文件 " + state.safe(capture.path), wrapWidth)) {
-                visualLines.add(new Line(line, MUTED));
-            }
-        }
-        visualLines.add(new Line("—— 视觉模型审查报告 ——", ACCENT));
-        String report = state.safe(state.visualReport);
-        if (report.isBlank()) {
-            visualLines.add(new Line("  （尚未分析，点击「AI 自由查看」把照片交给视觉模型）", MUTED));
-        } else {
-            for (String line : wrap(report, wrapWidth)) {
-                visualLines.add(new Line(line, TEXT));
-            }
-        }
-        if (!state.safeVisualIssues().isEmpty()) {
-            visualLines.add(new Line("—— 发现的问题 ——", ACCENT));
-            for (String issue : state.safeVisualIssues()) {
-                for (String line : wrap("  · " + issue, wrapWidth)) {
-                    visualLines.add(new Line(line, 0xFFFFCC66));
-                }
-            }
-        }
-
-        if (followLog) logScroll = maxScroll(logLines.size(), panelH);
-        if (followChat) chatScroll = maxScroll(chatLines.size(), panelH);
-        planScroll = Math.min(planScroll, maxScroll(planLines.size(), panelH));
-        infoScroll = Math.min(infoScroll, maxScroll(infoLines.size(), panelH));
-        if (followVisual) visualScroll = maxScroll(visualLines.size(), panelH);
+        g.drawString(font, "根建造区坐标（无体积上限）", cx, cy + 62, 0xD0D8E0);
+        int fw = (cw - 30) / 6;
+        for (int i = 0; i < 6; i++) g.drawString(font, FL[i], cx + i * (fw + 6), fy - 10, 0x8FA0B0);
+        if (!formMsg.isEmpty()) g.drawString(font, fit(formMsg, cw), cx, by + 22, 0xFFD080);
+        g.fill(cx, vy, cx + cw, vy + vh, 0x20101820);
+        if (tex != null && pw > 0 && ph > 0) {
+            float s = Math.min((cw - 8) / (float) pw, (vh - 8) / (float) ph);
+            int dw = Math.max(1, (int) (pw * s)), dh = Math.max(1, (int) (ph * s));
+            g.blit(tex, cx + (cw - dw) / 2, vy + (vh - dh) / 2, 0F, 0F, dw, dh, pw, ph);
+        } else g.drawString(font, fit(loading ? "正在渲染…" : "局部预览只渲染当前聚焦区域。", cw - 16), cx + 8, vy + vh / 2 - 4, 0x8FA0B0);
+        g.drawString(font, fit(previewMsg, cw), cx, vy + vh + 4, 0x9AA7B4);
+        if (!scanMsg.isEmpty()) g.drawString(font, fit(scanMsg, cw), cx, vy + vh + 16, 0x9AA7B4);
     }
 
-    private List<String> wrap(String text, int maxWidth) {
-        List<String> out = new ArrayList<>();
-        if (text == null || text.isEmpty()) {
-            out.add("");
-            return out;
-        }
-        StringBuilder current = new StringBuilder();
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c == '\n') {
-                out.add(current.toString());
-                current.setLength(0);
-                continue;
-            }
-            if (this.font.width(current.toString() + c) > maxWidth && current.length() > 0) {
-                out.add(current.toString());
-                current.setLength(0);
-            }
-            current.append(c);
-        }
-        out.add(current.toString());
-        return out;
-    }
-
-    // ------------------------------------------------------------------
-    // 绘制
-    // ------------------------------------------------------------------
-
-    @Override
-    public void renderBackground(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
-        super.renderBackground(g, mouseX, mouseY, partialTick);
-        if (linesDirty) {
-            rebuildLines();
-        }
-        g.fill(left, top, left + widthPx, top + heightPx, BG);
-        frame(g, left, top, widthPx, heightPx);
-        g.drawString(this.font, "建造指令 · Agent 自主建造", left + 10, top + 10, ACCENT, false);
-        String header = state == null ? "" : "任务 " + shortId() + "   模型调用 "
-                + state.modelCalls + " 次   " + (state.promptTokens + state.completionTokens) + " token";
-        g.drawString(this.font, header, left + widthPx - this.font.width(header) - 10, top + 10, MUTED, false);
-
-        g.fill(leftX, top + 26, leftX + leftW, bottom, PANEL);
-        frame(g, leftX, top + 26, leftW, bottom - top - 26);
-        drawLeftLabels(g);
-
-        g.fill(rightX - 4, top + 26, rightX + rightW + 4, bottom, PANEL);
-        frame(g, rightX - 4, top + 26, rightW + 8, bottom - top - 26);
-        drawTabLabels(g);
-        drawPanel(g);
-    }
-
-    private void drawLeftLabels(GuiGraphics g) {
-        int y = top + 30;
-        g.drawString(this.font, "建造范围（左键两次 / 手动填）", leftX, y, ACCENT, false);
-        g.drawString(this.font, "起点  X / Y / Z", leftX, y + 12, MUTED, false);
-        g.drawString(this.font, "终点  X / Y / Z", leftX, y + 48, MUTED, false);
-        g.fill(leftX, y + 122, leftX + leftW, y + 123, BORDER);
-
-        int sy = y + 130;
-        String status = state == null ? "—" : state.safe(state.status) + " / " + state.safe(state.stage);
-        boolean external = state != null && "external".equals(state.mode);
-        line(g, leftX, sy, "链路 " + (external ? "外部 Agent（MCP）" : "游戏内 Agent"), ACCENT);
-        line(g, leftX, sy + 14, "状态 " + status, TEXT);
-        line(g, leftX, sy + 28, "模型调用 " + (state == null ? 0 : state.modelCalls) + " 次",
-                external ? MUTED : ACCENT);
-        line(g, leftX, sy + 42, "Token  in " + (state == null ? 0 : state.promptTokens)
-                + " / out " + (state == null ? 0 : state.completionTokens), MUTED);
-        line(g, leftX, sy + 56, "记忆版本 v" + (state == null ? 0 : state.version), TEXT);
-        line(g, leftX, sy + 70, "已放置 " + (state == null ? 0 : state.blocksPlacedTotal) + " 方块", TEXT);
-        line(g, leftX, sy + 84, "范围 " + (state == null ? "无" : boundsText()), MUTED);
-        if (external) {
-            line(g, leftX, sy + 98, "由外部 Agent 通过 MCP 驱动", MUTED);
-        } else {
-            line(g, leftX, sy + 98, "Plan 模式 " + (state != null && state.planMode ? "开启" : "关闭"), MUTED);
-        }
-        g.drawString(this.font, "物品与记忆一一绑定，不可更换", leftX, bottom - 66, 0xFF7E8C9C, false);
-    }
-
-    private void line(GuiGraphics g, int x, int y, String text, int color) {
-        String clipped = text;
-        while (this.font.width(clipped) > leftW - 4 && clipped.length() > 1) {
-            clipped = clipped.substring(0, clipped.length() - 2) + "…";
-        }
-        g.drawString(this.font, clipped, x, y, color, false);
-    }
-
-    private void drawTabLabels(GuiGraphics g) {
-        switch (tab) {
-            case 0 -> {
-                g.drawString(this.font, "想要一个什么样的大概样子？一句话即可，Agent 会分阶段补全并施工",
-                        rightX, contentTop, MUTED, false);
-                g.drawString(this.font, "可读建造计划 / 当前建筑状态", rightX, contentTop + 64, ACCENT, false);
-            }
-            case 1 -> g.drawString(this.font, externalMode()
-                            ? "外部 Agent 动作（MCP 工具调用 / 范围设定 / 提交记录）"
-                            : "Agent 全过程输出（阶段规划 / 深度思考 / 编译 / 逐阶段放置）",
-                    rightX, contentTop, MUTED, false);
-            case 2 -> g.drawString(this.font, "Plan 对话只写可读《建造计划》，不生成建造指令；确认后才分阶段施工",
-                    rightX, contentTop, MUTED, false);
-            case 3 -> g.drawString(this.font, "结构化记忆：事实层 / 语义层 / 双写互校 / 构件树 / 版本",
-                    rightX, contentTop, MUTED, false);
-            case 4 -> g.drawString(this.font, "建筑周围的独立相机：拍照检查、AI 自由查看、视觉审查报告",
-                    rightX, contentTop, MUTED, false);
-            default -> {
-            }
-        }
-    }
-
-    private void drawPanel(GuiGraphics g) {
-        List<Line> lines = switch (tab) {
-            case 0 -> planLines;
-            case 1 -> logLines;
-            case 2 -> chatLines;
-            case 3 -> infoLines;
-            default -> visualLines;
-        };
-        int scroll = switch (tab) {
-            case 0 -> planScroll;
-            case 1 -> logScroll;
-            case 2 -> chatScroll;
-            case 3 -> infoScroll;
-            default -> visualScroll;
-        };
-        int x = panelX, y = panelY, w = panelW, h = Math.max(20, panelH);
-        g.fill(x, y, x + w, y + h, 0xFF0C1119);
-        g.fill(x, y, x + w, y + 1, BORDER);
-        g.fill(x, y + h - 1, x + w, y + h, BORDER);
-        g.fill(x, y, x + 1, y + h, BORDER);
-        g.fill(x + w - 1, y, x + w, y + h, BORDER);
-        g.enableScissor(x + 2, y + 2, x + w - 2, y + h - 2);
-        int first = Math.max(0, scroll / LINE_H);
-        for (int i = first; i < lines.size(); i++) {
-            int yy = y + 3 + i * LINE_H - scroll;
-            if (yy > y + h) break;
-            if (yy + LINE_H < y) continue;
-            g.drawString(this.font, lines.get(i).text(), x + 4, yy, lines.get(i).color(), false);
+    private void regions(GuiGraphics g, int mx, int my) {
+        List<Row> rows = flatten();
+        g.drawString(font, "全部区域（含层级） · " + rows.size(), cx, cy, 0xD0D8E0);
+        g.enableScissor(cx, ly, cx + cw, ly + lh);
+        for (int i = 0; i < rows.size(); i++) {
+            Row r = rows.get(i);
+            int y = ly + i * ROW - rScroll;
+            if (y + ROW < ly || y > ly + lh) continue;
+            boolean active = state != null && r.item.id.equals(state.activeRegionId);
+            g.fill(cx, y, cx + cw, y + ROW - 2, active ? 0x30204060 : (i % 2 == 0 ? 0x18182028 : 0x18141C24));
+            int tx = cx + 6 + r.depth * 10;
+            int textW = cw - 214 - r.depth * 10;
+            g.drawString(font, fit(r.item.name, textW), tx, y + 5, 0xFFFFFF);
+            g.drawString(font, fit(status(r.item.status) + " " + r.item.progress + "% · " + r.item.blocksPlaced + " 块", textW), tx, y + 17, 0xB8C4D0);
+            Bounds b = r.item.bounds();
+            g.drawString(font, fit(b == null ? "无边界" : b.display(), textW), tx, y + 29, 0x8FA0B0);
+            action(g, cx + cw - 184, y + 6, 40, 16, "子区", mx, my, 0xFF2A6A8A);
+            action(g, cx + cw - 138, y + 6, 40, 16, "聚焦", mx, my, 0xFF2A5A8A);
+            action(g, cx + cw - 92, y + 6, 40, 16, "传送", mx, my, 0xFF2A7A4A);
+            boolean root = "root".equals(r.item.id);
+            action(g, cx + cw - 46, y + 6, 40, 16, root ? "根区" : delLabel("region", r.item.id), mx, my, root ? 0xFF3A3A3A : 0xFF7A3A3A);
         }
         g.disableScissor();
-        int content = lines.size() * LINE_H;
-        if (content > h - 4) {
-            int trackH = h - 6;
-            int thumbH = Math.max(12, trackH * (h - 4) / content);
-            int thumbY = y + 3 + (trackH - thumbH) * scroll / Math.max(1, content - h + 4);
-            g.fill(x + w - 5, y + 3, x + w - 2, y + h - 3, 0xFF182230);
-            g.fill(x + w - 5, thumbY, x + w - 2, thumbY + thumbH, 0xFF6AA9C9);
+        if (rows.isEmpty()) g.drawString(font, "暂无区域；先选择根建造区。", cx + 8, ly + 8, 0x8FA0B0);
+    }
+
+    private void forbidden(GuiGraphics g, int mx, int my) {
+        List<ClientState.ForbiddenItem> list = state == null ? List.of() : state.safeForbiddenZones();
+        g.drawString(font, "禁建区 · " + list.size() + "（可超出根区，写入前强制拦截）", cx, cy, 0xD0D8E0);
+        g.enableScissor(cx, ly, cx + cw, ly + lh);
+        for (int i = 0; i < list.size(); i++) {
+            ClientState.ForbiddenItem z = list.get(i);
+            int y = ly + i * ROW - fScroll;
+            if (y + ROW < ly || y > ly + lh) continue;
+            g.fill(cx, y, cx + cw, y + ROW - 2, i % 2 == 0 ? 0x18281818 : 0x18241414);
+            g.drawString(font, fit(z.name, cw - 110), cx + 6, y + 5, 0xFF8080);
+            Bounds b = z.bounds();
+            g.drawString(font, fit(b == null ? "无边界" : b.display(), cw - 110), cx + 6, y + 17, 0xB8C4D0);
+            g.drawString(font, fit(z.description == null || z.description.isEmpty() ? "服务端放置时拦截" : z.description, cw - 110), cx + 6, y + 29, 0x8FA0B0);
+            action(g, cx + cw - 92, y + 6, 40, 16, "传送", mx, my, 0xFF2A7A4A);
+            action(g, cx + cw - 46, y + 6, 40, 16, delLabel("forbidden", z.id), mx, my, 0xFF7A3A3A);
         }
+        g.disableScissor();
+        if (list.isEmpty()) g.drawString(font, "暂无禁建区；点击右上角「两点新增禁建区」。", cx + 8, ly + 8, 0x8FA0B0);
     }
 
-    private void frame(GuiGraphics g, int x, int y, int w, int h) {
-        g.fill(x, y, x + w, y + 1, BORDER);
-        g.fill(x, y + h - 1, x + w, y + h, BORDER);
-        g.fill(x, y, x + 1, y + h, BORDER);
-        g.fill(x + w - 1, y, x + w, y + h, BORDER);
+    private void logs(GuiGraphics g) {
+        List<ClientState.LogItem> list = state == null ? List.of() : state.safeLogs();
+        g.drawString(font, "运行日志 · " + list.size(), cx, cy, 0xD0D8E0);
+        g.enableScissor(cx, ly, cx + cw, ly + lh);
+        for (int i = 0; i < list.size(); i++) {
+            ClientState.LogItem l = list.get(i);
+            int y = ly + i * LOG - lScroll;
+            if (y + LOG < ly || y > ly + lh) continue;
+            int color = "ERROR".equals(l.level) ? 0xFF6060 : "WARN".equals(l.level) ? 0xFFC060 : 0xB8C4D0;
+            g.drawString(font, fit("[" + l.stage + "] " + l.text, cw - 8), cx + 4, y, color);
+        }
+        g.disableScissor();
+        if (list.isEmpty()) g.drawString(font, "暂无日志。", cx + 8, ly + 8, 0x8FA0B0);
     }
 
-    @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
-        if (mouseX >= panelX && mouseX <= panelX + panelW && mouseY >= panelY && mouseY <= panelY + panelH) {
-            int delta = (int) (-scrollY * LINE_H * 3);
-            switch (tab) {
-                case 0 -> planScroll = clampScroll(planScroll + delta, planLines.size());
-                case 1 -> {
-                    logScroll = clampScroll(logScroll + delta, logLines.size());
-                    followLog = logScroll >= maxScroll(logLines.size(), panelH);
+    private void action(GuiGraphics g, int x, int y, int w, int h, String label, int mx, int my, int color) {
+        boolean hover = mx >= x && mx < x + w && my >= y && my < y + h;
+        g.fill(x, y, x + w, y + h, hover ? color | 0x202020 : color);
+        g.drawString(font, label, x + (w - font.width(label)) / 2, y + 4, 0xFFFFFF);
+    }
+
+    private String delLabel(String kind, String id) {
+        return kind.equals(delKind) && id.equals(delId) && System.currentTimeMillis() < delUntil ? "确认?" : "删除";
+    }
+
+    private List<Row> flatten() {
+        List<Row> out = new ArrayList<>();
+        if (state == null) return out;
+        List<ClientState.RegionItem> all = state.safeRegions();
+        Set<String> seen = new HashSet<>();
+        for (ClientState.RegionItem r : all) if (r.parentId == null || r.parentId.isEmpty() || find(all, r.parentId) == null) add(out, all, r, 0, seen);
+        for (ClientState.RegionItem r : all) add(out, all, r, 0, seen);
+        return out;
+    }
+    private void add(List<Row> out, List<ClientState.RegionItem> all, ClientState.RegionItem r, int depth, Set<String> seen) {
+        if (r == null || !seen.add(r.id)) return;
+        out.add(new Row(r, depth));
+        for (ClientState.RegionItem c : all) if (r.id.equals(c.parentId)) add(out, all, c, depth + 1, seen);
+    }
+    private static ClientState.RegionItem find(List<ClientState.RegionItem> all, String id) {
+        for (ClientState.RegionItem r : all) if (r.id.equals(id)) return r;
+        return null;
+    }
+    private static final class Row { final ClientState.RegionItem item; final int depth; Row(ClientState.RegionItem i, int d) { item = i; depth = d; } }
+
+    @Override public boolean mouseClicked(double mx, double my, int button) {
+        if (button == 0 && my >= ly && my < ly + lh && mx >= cx && mx < cx + cw) {
+            if (tab == Tab.REGIONS) {
+                List<Row> rows = flatten();
+                int i = (int) ((my - ly + rScroll) / ROW);
+                if (i >= 0 && i < rows.size()) {
+                    Row r = rows.get(i);
+                    int y = ly + i * ROW - rScroll;
+                    if (hit(mx, my, cx + cw - 184, y + 6, 40, 16)) { mode("CHILD_REGION", r.item.id); return true; }
+                    if (hit(mx, my, cx + cw - 138, y + 6, 40, 16)) { JsonObject d = new JsonObject(); d.addProperty("id", r.item.id); send("focus_region", d); return true; }
+                    if (hit(mx, my, cx + cw - 92, y + 6, 40, 16)) { teleport("region", r.item.id); return true; }
+                    if (!"root".equals(r.item.id) && hit(mx, my, cx + cw - 46, y + 6, 40, 16)) { delete("region", r.item.id); return true; }
+                    JsonObject d = new JsonObject(); d.addProperty("id", r.item.id); send("focus_region", d); return true;
                 }
-                case 2 -> {
-                    chatScroll = clampScroll(chatScroll + delta, chatLines.size());
-                    followChat = chatScroll >= maxScroll(chatLines.size(), panelH);
-                }
-                case 3 -> infoScroll = clampScroll(infoScroll + delta, infoLines.size());
-                default -> {
-                    visualScroll = clampScroll(visualScroll + delta, visualLines.size());
-                    followVisual = visualScroll >= maxScroll(visualLines.size(), panelH);
+            } else if (tab == Tab.FORBIDDEN && state != null) {
+                List<ClientState.ForbiddenItem> list = state.safeForbiddenZones();
+                int i = (int) ((my - ly + fScroll) / ROW);
+                if (i >= 0 && i < list.size()) {
+                    ClientState.ForbiddenItem z = list.get(i);
+                    int y = ly + i * ROW - fScroll;
+                    if (hit(mx, my, cx + cw - 92, y + 6, 40, 16)) { teleport("forbidden", z.id); return true; }
+                    if (hit(mx, my, cx + cw - 46, y + 6, 40, 16)) { delete("forbidden", z.id); return true; }
                 }
             }
-            return true;
         }
-        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        return super.mouseClicked(mx, my, button);
+    }
+    private static boolean hit(double mx, double my, int x, int y, int w, int h) { return mx >= x && mx < x + w && my >= y && my < y + h; }
+    private void teleport(String kind, String id) { JsonObject d = new JsonObject(); d.addProperty("kind", kind); d.addProperty("id", id); send("teleport", d); onClose(); }
+    private void delete(String kind, String id) {
+        if (kind.equals(delKind) && id.equals(delId) && System.currentTimeMillis() < delUntil) {
+            JsonObject d = new JsonObject(); d.addProperty("id", id);
+            send("region".equals(kind) ? "delete_region" : "delete_forbidden", d);
+            delKind = ""; delId = "";
+        } else { delKind = kind; delId = id; delUntil = System.currentTimeMillis() + 5000; }
     }
 
-    private int clampScroll(int value, int lineCount) {
-        return Math.max(0, Math.min(maxScroll(lineCount, panelH), value));
+    @Override public boolean mouseScrolled(double mx, double my, double sx, double sy) {
+        int max;
+        if (tab == Tab.REGIONS) { max = Math.max(0, flatten().size() * ROW - lh); rScroll = clamp(rScroll - (int) (sy * 24), max); return true; }
+        if (tab == Tab.FORBIDDEN) { max = Math.max(0, (state == null ? 0 : state.safeForbiddenZones().size()) * ROW - lh); fScroll = clamp(fScroll - (int) (sy * 24), max); return true; }
+        if (tab == Tab.LOGS) { max = Math.max(0, (state == null ? 0 : state.safeLogs().size()) * LOG - lh); lScroll = clamp(lScroll - (int) (sy * 24), max); autoLog = lScroll >= max; return true; }
+        return super.mouseScrolled(mx, my, sx, sy);
+    }
+    private static int clamp(int v, int max) { return Math.max(0, Math.min(v, max)); }
+
+    private String shortId() { return taskId.length() >= 8 ? taskId.substring(0, 8) : taskId; }
+    private static String status(String s) { return "DONE".equals(s) ? "已完成" : "IN_PROGRESS".equals(s) ? "建造中" : "待建造"; }
+    private String fit(String s, int w) {
+        if (s == null) return "";
+        if (font.width(s) <= w) return s;
+        while (s.length() > 1 && font.width(s + "..") > w) s = s.substring(0, s.length() - 1);
+        return s + "..";
     }
 
-    private int maxScroll(int lineCount, int h) {
-        return Math.max(0, lineCount * LINE_H - Math.max(20, h) + 8);
-    }
-
-    // ------------------------------------------------------------------
-    // 动作
-    // ------------------------------------------------------------------
-
-    private void send(String action, String data) {
-        PacketDistributor.sendToServer(new ModPackets.C2SAction(taskId, action, data));
-    }
-
-    private void applyBounds() {
-        JsonObject o = new JsonObject();
-        JsonArray array = new JsonArray();
-        for (String value : coordText) {
-            try {
-                array.add(Integer.parseInt(value.trim()));
-            } catch (Exception e) {
-                array.add(0);
-            }
-        }
-        o.add("bounds", array);
-        send("bounds", Json.GSON.toJson(o));
-        coordsEdited = false;
-    }
-
-    /** 一个按钮：服务端根据任务记忆自动判定是新建还是修改，客户端不再传 modify。 */
-    private void build() {
-        if (commandText == null || commandText.isBlank()) {
-            return;
-        }
-        JsonObject o = new JsonObject();
-        o.addProperty("text", commandText);
-        send("build", Json.GSON.toJson(o));
-        tab = 1;
-        rebuildWidgets();
-    }
-
-    private void sendChat() {
-        if (chatText == null || chatText.isBlank()) {
-            return;
-        }
-        JsonObject o = new JsonObject();
-        o.addProperty("text", chatText);
-        send("plan_send", Json.GSON.toJson(o));
-        chatText = "";
-        if (chatBox != null) {
-            chatBox.setValue("");
-        }
-    }
-
-    private void confirmPlan() {
-        JsonObject o = new JsonObject();
-        o.addProperty("usePlan", true);
-        send("plan_build", Json.GSON.toJson(o));
-        tab = 1;
-        rebuildWidgets();
-    }
-
-    /** 手动指定一台相机：x,y,z,yaw,pitch，拍照并交给视觉模型审查。 */
-    private void sendCustomPose() {
-        if (poseText == null || poseText.isBlank()) {
-            return;
-        }
-        JsonObject o = new JsonObject();
-        o.addProperty("pose", poseText);
-        send("visual_custom", Json.GSON.toJson(o));
-    }
-
-    @Override
-    public void onClose() {
-        send("close", "{}");
+    @Override public void onClose() {
+        PacketDistributor.sendToServer(new ModPackets.C2SAction(taskId, "close", "{}"));
         super.onClose();
     }
-
-    private String boundsText() {
-        if (state == null || !state.hasBounds || state.bounds == null || state.bounds.length != 6) {
-            return "未选择";
-        }
-        int[] b = state.bounds;
-        return b[0] + "," + b[1] + "," + b[2] + "→" + b[3] + "," + b[4] + "," + b[5];
-    }
-
-    private String shortId() {
-        return taskId.length() > 8 ? taskId.substring(0, 8) : taskId;
-    }
+    @Override public void removed() { closePreview(); super.removed(); }
+    @Override public boolean isPauseScreen() { return false; }
 }

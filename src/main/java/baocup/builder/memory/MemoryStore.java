@@ -123,7 +123,8 @@ public final class MemoryStore {
         if (m.status == null) m.status = "IDLE";
         if (m.stage == null) m.stage = "待命";
         if (m.userBrief == null) m.userBrief = "";
-        if (m.linkMode == null || m.linkMode.isBlank()) m.linkMode = "internal";
+        m.linkMode = "external";
+        m.ensureRegions();
         if (m.notes == null) m.notes = "";
         if (m.currentPlanJson == null) m.currentPlanJson = "";
         if (m.planDocument == null) m.planDocument = "";

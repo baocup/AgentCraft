@@ -1,51 +1,79 @@
 package baocup.builder.item;
 
-import java.util.List;
-
-import baocup.builder.util.Bounds;
-import net.minecraft.core.BlockPos;
-import net.minecraft.nbt.CompoundTag;
+import baocup.builder.agent.AgentManager;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.item.context.UseOnContext;
+import net.minecraft.world.level.Level;
 
-/**
- * 外部 Agent 建造手杖：只负责「选坐标」和「被外部 Agent 通过 MCP 读取 taskId」。
- *
- * 它完全不参与游戏内 LLM Agent 的启动、Plan 对话、语义层与视觉审查，
- * 因此用外部 Agent 建造时不会消耗任何游戏内模型 token。
- */
-public class ExternalBuildWandItem extends BuildCommanderItem {
+import java.util.List;
+
+/** 外部 Agent 建造手杖：选区、区域/禁建区管理与客户端 MCP 的唯一入口。 */
+public class ExternalBuildWandItem extends Item {
     public ExternalBuildWandItem(Properties properties) {
         super(properties);
     }
 
     @Override
-    protected String linkMode() {
-        return "external";
+    public void inventoryTick(ItemStack stack, Level level, net.minecraft.world.entity.Entity entity,
+                              int slot, boolean selected) {
+        if (!level.isClientSide) {
+            ItemData.ensureTaskId(stack);
+        }
     }
 
     @Override
-    public void appendHoverText(ItemStack stack, TooltipContext context, List<Component> lines,
-                                TooltipFlag flag) {
-        lines.add(Component.literal("§b外部 Agent 建造手杖 §7（不调用游戏内模型）"));
-        lines.add(Component.literal("§71. 左键两次设定建造范围起终点"));
-        lines.add(Component.literal("§72. 保持手持，去外部 Agent 对话（MCP 会读到此任务 id）"));
-        lines.add(Component.literal("§73. 右键打开本页面查看外部 Agent 的动作日志"));
-        CompoundTag tag = ItemData.read(stack);
-        BlockPos p1 = ItemData.point(tag, ItemData.P1);
-        BlockPos p2 = ItemData.point(tag, ItemData.P2);
-        if (p1 != null) {
-            lines.add(Component.literal("§8起点 " + format(p1)));
+    public InteractionResult useOn(UseOnContext context) {
+        Level level = context.getLevel();
+        Player player = context.getPlayer();
+        ItemStack stack = context.getItemInHand();
+        if (level.isClientSide || player == null) {
+            return InteractionResult.SUCCESS;
         }
-        if (p2 != null) {
-            lines.add(Component.literal("§a终点 " + format(p2) + "  " + Bounds.of(p1, p2).display()));
+        ItemData.ensureTaskId(stack);
+        if (player.isCrouching()) {
+            openGui(player, stack);
+            return InteractionResult.CONSUME;
         }
-        String id = ItemData.taskId(stack);
-        if (id == null) {
-            lines.add(Component.literal("§8任务 id：首次使用时分配"));
+        return InteractionResult.PASS;
+    }
+
+    @Override
+    public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+        ItemStack stack = player.getItemInHand(hand);
+        if (level.isClientSide) {
+            return InteractionResultHolder.success(stack);
+        }
+        ItemData.ensureTaskId(stack);
+        openGui(player, stack);
+        return InteractionResultHolder.consume(stack);
+    }
+
+    private void openGui(Player player, ItemStack stack) {
+        if (player instanceof ServerPlayer serverPlayer) {
+            AgentManager.get().openGui(serverPlayer, ItemData.taskId(stack), "external");
+        }
+    }
+
+    @Override
+    public void appendHoverText(ItemStack stack, Item.TooltipContext context,
+                                List<Component> tooltip, TooltipFlag flag) {
+        tooltip.add(Component.literal("§7外部 Agent 专用 · 客户端 MCP"));
+        tooltip.add(Component.literal("§7右键打开控制台；潜行右键方块也可打开"));
+        tooltip.add(Component.literal("§7默认不选点；控制台点按钮武装后左键两点，完成自动退出"));
+        tooltip.add(Component.literal("§7手持显示蓝/黄/红线框与半透明面"));
+        String taskId = ItemData.taskId(stack);
+        if (taskId == null || taskId.isEmpty()) {
+            tooltip.add(Component.literal("§8任务 未分配（取出后自动生成）"));
         } else {
-            lines.add(Component.literal("§8任务 id：" + id.substring(0, Math.min(13, id.length())) + "…"));
+            tooltip.add(Component.literal("§8任务 " + (taskId.length() >= 8 ? taskId.substring(0, 8) : taskId)));
         }
     }
 }

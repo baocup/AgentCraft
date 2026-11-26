@@ -50,10 +50,9 @@ credits="外部 Agent 链路基于 MCP（JSON-RPC over HTTP）；建造照片为
 
 # The description text for the mod (multi line!) (#mandatory)
 description='''
-输入一句对建筑的描述 + 选好坐标范围，游戏内 LLM Agent 会自主规划并把它建完整。
-
-也可以完全不用游戏内模型：手持「外部建造手杖」，让本地 Agent（Codex / Claude Code /
-Cursor / WorkBuddy 等）通过 MCP 直接建模、拍照与提交方块，全程 0 次模型调用。
+手持「外部建造手杖」划定无体积上限的根建造区，并递归细分区域、设置禁建区。
+本地 Agent（Codex / Claude Code / Cursor / WorkBuddy 等）通过 MCP 直接分页检测地形、
+局部建模、确定性校验、拍照与分段提交方块，全程 0 次游戏内模型调用。
 '''
 
 # The [[mixins]] block allows you to declare your mixin config to FML so that it gets loaded.

@@ -566,6 +566,12 @@ public final class Prompts {
             }
         }
         o.add("bounds", bounds);
+        m.ensureRegions();
+        o.addProperty("activeRegionId", m.activeRegionId);
+        o.add("activeBounds", Json.GSON.toJsonTree(m.activeRegion().bounds == null
+                ? new int[0] : m.activeRegion().bounds));
+        o.add("regions", Json.GSON.toJsonTree(m.safeRegions()));
+        o.add("forbiddenZones", Json.GSON.toJsonTree(m.safeForbiddenZones()));
         o.addProperty("status", m.status);
         o.addProperty("stage", m.stage);
         o.addProperty("mode", m.linkMode);

@@ -20,6 +20,7 @@ public class BuilderClient {
         BuilderMod.clientStateHandler = BuilderClient::onState;
         BuilderMod.clientQueryHandler = ClientBuildHost.INSTANCE::onQueryResult;
         NeoForge.EVENT_BUS.register(new SelectionInput());
+        NeoForge.EVENT_BUS.register(new RegionPreviewRenderer());
         NeoForge.EVENT_BUS.addListener(BuilderClient::onClientTick);
     }
 
@@ -47,10 +48,11 @@ public class BuilderClient {
         }
         final ClientState snapshot = state;
         mc.execute(() -> {
-            if (payload.open() || !(mc.screen instanceof BuilderScreen screen)
-                    || !screen.taskId.equals(snapshot.taskId)) {
+            RegionPreviewRenderer.onState(snapshot);
+            ClientBuildHost.INSTANCE.onState(snapshot);
+            if (payload.open()) {
                 mc.setScreen(new BuilderScreen(snapshot));
-            } else {
+            } else if (mc.screen instanceof BuilderScreen screen && screen.taskId.equals(snapshot.taskId)) {
                 screen.applyState(snapshot);
             }
         });

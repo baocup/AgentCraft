@@ -92,16 +92,27 @@ public final class VoxelWorld {
 
     private final ConcurrentHashMap<Long, Voxel> voxels = new ConcurrentHashMap<>();
     private final Bounds selection;
+    private final int minY;
+    private final int maxY;
+    private final List<Bounds> forbiddenZones;
 
     public VoxelWorld(Bounds selection) {
-        this.selection = selection;
+        this(selection, -64, 319, List.of());
+    }
+
+    public VoxelWorld(Bounds selection, int minY, int maxY, List<Bounds> forbiddenZones) {
+        this.selection = selection == null ? null : selection.copy();
+        this.minY = minY;
+        this.maxY = maxY;
+        this.forbiddenZones = forbiddenZones == null ? List.of() : List.copyOf(forbiddenZones);
     }
 
     /** 从上一版本的完整方块图恢复，用于「修改建筑」。 */
     public void load(List<Placement> previous) {
         for (Placement placement : previous) {
             placement.normalize();
-            if ("minecraft:air".equals(placement.block)) {
+            if ("minecraft:air".equals(placement.block)
+                    || validate(placement.x, placement.y, placement.z, placement.block) != null) {
                 continue;
             }
             voxels.put(key(placement.x, placement.y, placement.z),
@@ -142,8 +153,13 @@ public final class VoxelWorld {
         if (selection != null && !selection.contains(x, y, z)) {
             return "坐标落在选区外";
         }
-        if (y < -64 || y > 319) {
-            return "Y 超出世界高度范围";
+        if (y < minY || y > maxY) {
+            return "Y 超出世界高度范围 " + minY + ".." + maxY;
+        }
+        for (Bounds forbidden : forbiddenZones) {
+            if (forbidden.contains(x, y, z)) {
+                return "坐标位于禁建区";
+            }
         }
         if (block == null || block.isBlank()) {
             return "方块 id 为空";
@@ -183,6 +199,12 @@ public final class VoxelWorld {
         if (selection != null && !selection.contains(x, y, z)) {
             result.rejections.add(new Rejection(x, y, z, "坐标落在选区外"));
             return result;
+        }
+        for (Bounds forbidden : forbiddenZones) {
+            if (forbidden.contains(x, y, z)) {
+                result.rejections.add(new Rejection(x, y, z, "坐标位于禁建区"));
+                return result;
+            }
         }
         if (voxels.remove(key(x, y, z)) != null) {
             result.removed++;
