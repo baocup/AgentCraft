@@ -40,7 +40,7 @@ public final class MemoryStore {
     private final Path selectionFile;
 
     public MemoryStore(Path gameDir) {
-        this.root = gameDir.resolve("config/builder/memory");
+        this.root = gameDir.resolve("config/agentcraft/memory");
         this.tasks = root.resolve("tasks");
         this.blocksDir = root.resolve("blocks");
         this.factsDir = root.resolve("facts");
@@ -54,7 +54,7 @@ public final class MemoryStore {
         return root;
     }
 
-    /** 某个任务的照片目录：config/builder/memory/captures/&lt;taskId&gt;/ */
+    /** 某个任务的照片目录：config/agentcraft/memory/captures/&lt;taskId&gt;/ */
     public Path captureDir(String taskId) {
         return capturesDir.resolve(taskId);
     }

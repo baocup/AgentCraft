@@ -14,7 +14,7 @@ import baocup.builder.util.Bounds;
 /**
  * 单个建造任务的完整记忆。任务结束后不删除：
  * - 内存里常驻（服务端生命周期内）
- * - 每次改动原子写入 config/builder/memory/tasks/&lt;uuid&gt;.json
+ * - 每次改动原子写入 config/agentcraft/memory/tasks/&lt;uuid&gt;.json
  * - 每个完成版本另存 gzip 的完整方块图，用于修改时做差量对比
  * 游戏 / 服务器重启后由 MemoryStore 重新加载。
  */

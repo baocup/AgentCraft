@@ -1,6 +1,6 @@
-# AI Builder（NeoForge 1.21.1）
+# AgentCraft（NeoForge 1.21.1）
 
-给一句话 + 一个坐标范围，在游戏里自动建造 3D 建筑。提供两条互不相干的链路：**游戏内 LLM Agent（接入大模型API）** 和 **外部 Agent（Skill + MCP）**。
+给一句话 + 一个坐标范围，在游戏里自动建造 3D 建筑。提供两条互不相干的链路：**游戏内 LLM Agent（接入大模型API）** 和 **外部 Agent（Skill + MCP）**。外部链路的技能既可直接导入 `skills/`，也已打包成 DeepSeek Harness 插件（`Agent-plugins/`，见下文「Agent 插件」）。
 
 ## 测试指令
 
@@ -35,8 +35,8 @@
 
 ### 外部 Agent（MCP，0 次模型调用）
 
-1. 手持**外部建造手杖**，左键两次选好范围，**保持手持**。
-2. 在本地 Agent（Codex / Claude Code / Cursor / WorkBuddy / DeepSeekHarness）里导入 `skills/minecraft-builder/`，连 `http://127.0.0.1:8765/mcp`：
+1. 手持**外部建造手杖**（默认不选点，左键只挥手）。右键开 GUI 点「选根区」武装，再左键两点选好范围——第二点落下自动退出选点；**保持手持**。也可以不选点，直接让 Agent 调 `request_bounds` 自主设界。
+2. 在本地 Agent（Codex / Claude Code / Cursor / WorkBuddy / DeepSeekHarness）里导入 `skills/minecraft-builder/`，连 `http://127.0.0.1:8765/mcp`（DeepSeek Harness 也可改装打包好的插件，见下文「Agent 插件」）：
 
    ```json
    {"mcpServers":{"minecraft-builder":{"type":"http","url":"http://127.0.0.1:8765/mcp"}}}
@@ -47,12 +47,25 @@
 
 工具清单、坐标规则、形状表达式都在 `skills/minecraft-builder/SKILL.md`，参数 schema 由 MCP 的 `tools/list` 实时返回。
 
+## Agent 插件（Agent-plugins）
+
+除了手动导入 `skills/`，外部链路技能还打包成了一个 **DeepSeek Harness（DSH）插件 bundle**，位于 `Agent-plugins/minecraft-builder/`。装一行插件就同时拿到「技能说明 + 客户端 MCP 连接」，不必再分别配技能目录和 MCP server。
+
+- **它做了什么**：`index.js` 从随包的 `skills/minecraft-builder/SKILL.md` 注册技能（名称 / 描述 / 触发时机取自 frontmatter，与游戏项目里的技能保持一致），并把客户端本地 MCP（`http://127.0.0.1:8765/mcp`，Streamable HTTP）贡献给 Harness 的 MCP 管理器。工具随之暴露为 `mcp__minecraft_builder__<tool>`（共 23 个建造工具）。
+- **安装**：Web GUI **Plugins > Add plugin** 选择本地目录（填 `Agent-plugins/minecraft-builder/` 的绝对路径）；插件管理器工具也可用绝对路径安装。列表里显示为 **Minecraft builder**，可按 profile 启用 / 禁用。
+- **连接自愈**：MCP 管理器负责重连——游戏没开时保留技能并持续重试，游戏重启无需重启 Harness。
+- **可选配置**（插件行 `config`，均可省略）：`url`（默认 `http://127.0.0.1:8765/mcp`）、`serverName`（默认 `minecraft_builder`，决定工具命名空间）、`token`（游戏配了 `mcpToken` 时作为 `Authorization: Bearer`）、`headers`、`startupTimeoutMs`（默认 15000）、`toolCallTimeoutMs`（默认 120000）。未显式配置时读环境变量 `MINECRAFT_MCP_URL` / `MINECRAFT_MCP_TOKEN`；token 也可写成 `${credential:MINECRAFT_MCP_TOKEN}` 交给凭据管理器解析。
+- **前提**：客户端 `mcpEnabled = true` 且日志出现监听提示；玩家手持外部建造手杖；多开客户端各配不同 `mcpPort`，一行插件驱动一个实例。
+- 详细说明见插件自带 [`Agent-plugins/minecraft-builder/README.md`](Agent-plugins/minecraft-builder/README.md)。
+
+> 其它 Agent（Codex / Claude Code / Cursor / WorkBuddy）仍按上一节手动导入 `skills/` + 配置 MCP；插件目前面向 DeepSeek Harness。
+
 ## 运行逻辑
 
 - **外部链路的接口在客户端**：MCP 服务、几何编译、`VoxelWorld`、拍照渲染全部跑在玩家客户端；建模完成后只把最终方块分批发给服务端写世界。所以多玩家 / 多 Agent 并行不会互相覆盖，服务端也不做离屏渲染。
 - **内部 Agent 跑在服务端**：模型通过 tool calling 读状态、放方块、拍照、修正，本地只负责把几何编译成体素并写进世界。
 - 两条链路按任务 id 隔离；同一个任务同时只能有一个执行者。
-- 坐标范围有三种确定方式：玩家左键两次、玩家在 GUI 里手动输入坐标、或外部 Agent 调用 `request_bounds` 自主设定（会写回手杖并立即生效）。写入仍受 `bounds` 约束，超出会被逐条拒绝。
+- 坐标范围有三种确定方式：玩家在 GUI 武装后左键两点（默认不选点，第二点落下自动退出）、玩家在 GUI 里手动输入坐标、或外部 Agent 调用 `request_bounds` 自主设定（会写回手杖并立即生效）。写入仍受 `bounds` 约束，超出会被逐条拒绝。
 - 形状没有白名单：`draw_shape` 的 `where` 是任意数学谓词（`x y z`、`cx cy cz`、`rx ry rz` 等变量，`abs/sin/clamp/lerp` 等函数），`&& || !` 即任意并集 / 交集 / 差集。
 
 ## 构建
@@ -68,7 +81,7 @@
 
 ## 配置
 
-`run/config/builder-common.toml`，最常改的几项：
+`run/config/agentcraft-common.toml`，最常改的几项：
 
 ```toml
 [llm]
@@ -112,14 +125,14 @@ mcpToken   = ""         # 填了则客户端需带 Authorization: Bearer <token>
 ## 协议与文件
 
 - 网络载荷：`C2SAction`（GUI 动作）、`C2SCommit`（客户端提交方块）、`S2CState`（状态快照）。
-- 任务记忆：`run/config/builder/memory/`（`tasks/*.json` 任务、`blocks/*.gz` 每版方块图、`selections.json` 选区）。
-- 照片：客户端 `gameDirectory/builder-captures/<taskId>/`。
+- 任务记忆：`run/config/agentcraft/memory/`（`tasks/*.json` 任务、`blocks/*.gz` 每版方块图、`selections.json` 选区）。
+- 照片：客户端 `gameDirectory/agentcraft-captures/<taskId>/`。
 
 ## 免责
 
 模型输出不可控，可能出现造型不符预期、坐标浪费，或在自动修正时改动周围方块的情况。建议：
 
-- 在**独立的创造模式存档**里试用，重要建筑先备份 `run/config/builder/memory/`；
+- 在**独立的创造模式存档**里试用，重要建筑先备份 `run/config/agentcraft/memory/`；
 - 外部 Agent 链路的选区完全由玩家手杖决定，只授予你信任的范围。
 
 ## 许可

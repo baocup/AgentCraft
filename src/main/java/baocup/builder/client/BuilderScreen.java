@@ -143,7 +143,7 @@ public class BuilderScreen extends Screen {
             NativeImage img = NativeImage.read(in);
             pw = img.getWidth(); ph = img.getHeight();
             dyn = new DynamicTexture(img);
-            tex = ResourceLocation.fromNamespaceAndPath("builder", "preview/" + san(taskId) + "/" + san(state == null ? "root" : state.activeRegionId));
+            tex = ResourceLocation.fromNamespaceAndPath(baocup.builder.BuilderMod.MODID, "preview/" + san(taskId) + "/" + san(state == null ? "root" : state.activeRegionId));
             Minecraft.getInstance().getTextureManager().register(tex, dyn);
             previewMsg = "预览：" + Path.of(path).getFileName();
         } catch (Exception e) { previewMsg = "预览加载失败：" + e.getMessage(); }

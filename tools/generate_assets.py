@@ -6,8 +6,8 @@
     python tools/generate_assets.py [path/to/minecraft_1.21.1_client.jar]
 
 产物：
-    src/main/resources/assets/builder/block_index.json
-    src/main/resources/assets/builder/textures/item/build_commander.png
+    src/main/resources/assets/agentcraft/block_index.json
+    src/main/resources/assets/agentcraft/textures/item/external_build_wand.png
 
 只依赖 Python 标准库（自带一个最小 PNG 解码器，支持调色板 / 1,2,4,8 位深 / PNG 滤波器）。
 """
@@ -24,7 +24,7 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "src" / "main" / "resources" / "assets" / "builder"
+OUT = ROOT / "src" / "main" / "resources" / "assets" / "agentcraft"
 DEFAULT_JAR = Path.home() / ".gradle" / "caches" / "neoformruntime" / "artifacts" / "minecraft_1.21.1_client.jar"
 
 # ---------------------------------------------------------------------------
@@ -825,8 +825,8 @@ def main() -> None:
     print("方块索引：%d 个方块，其中 %d 个读取到了真实贴图" % (index["count"], index["textured"]))
     print("输出：", OUT / "block_index.json")
 
-    write_png(OUT / "textures" / "item" / "build_commander.png", 16, 16,
-              item_icon("build_commander"))
+    write_png(OUT / "textures" / "item" / "external_build_wand.png", 16, 16,
+              item_icon("external_build_wand"))
     print("物品贴图已生成")
 
 

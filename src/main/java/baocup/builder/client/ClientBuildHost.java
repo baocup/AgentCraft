@@ -1166,7 +1166,7 @@ public final class ClientBuildHost {
     private Path captureDir(String taskId) {
         Minecraft mc = Minecraft.getInstance();
         // 用完整 taskId 做目录：只取前 8 位理论上可能碰撞，会让两个任务共用照片目录
-        return mc.gameDirectory.toPath().resolve("builder-captures").resolve(taskId);
+        return mc.gameDirectory.toPath().resolve("agentcraft-captures").resolve(taskId);
     }
 
     private static boolean sameBounds(int[] a, int[] b) {

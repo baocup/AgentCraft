@@ -12,7 +12,7 @@
     "PPP"
   ],
   "result": {
-    "id": "builder:external_build_wand",
+    "id": "agentcraft:external_build_wand",
     "count": 1
   }
 }

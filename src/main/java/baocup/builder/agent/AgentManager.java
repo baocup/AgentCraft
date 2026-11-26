@@ -633,7 +633,7 @@ public final class AgentManager {
 
     public java.nio.file.Path captureDir(String taskId) {
         return store == null
-                ? java.nio.file.Path.of("config/builder/memory/captures", taskId)
+                ? java.nio.file.Path.of("config/agentcraft/memory/captures", taskId)
                 : store.captureDir(taskId);
     }
 

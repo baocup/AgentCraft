@@ -44,7 +44,7 @@ public final class BlockIndex {
         public boolean buildable = true;
     }
 
-    private static final String RESOURCE = "/assets/builder/block_index.json";
+    private static final String RESOURCE = "/assets/agentcraft/block_index.json";
     private static final String BASELINE = "石砖 木板 玻璃 台阶 屋顶 灯 柱子 墙体 地板";
     private static final String[] ALWAYS = {
             "minecraft:stone_bricks", "minecraft:oak_planks", "minecraft:spruce_planks",
@@ -84,9 +84,9 @@ public final class BlockIndex {
         return instance;
     }
 
-    /** 允许用 config/builder/block_index.json 覆盖 / 扩充内置索引（例如手工补充模组方块的外观）。 */
+    /** 允许用 config/agentcraft/block_index.json 覆盖 / 扩充内置索引（例如手工补充模组方块的外观）。 */
     public void loadExternal(Path gameDir) {
-        external = gameDir.resolve("config/builder/block_index.json");
+        external = gameDir.resolve("config/agentcraft/block_index.json");
         if (!Files.isRegularFile(external)) {
             return;
         }

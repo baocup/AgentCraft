@@ -1,6 +1,6 @@
 {
   "parent": "item/generated",
   "textures": {
-    "layer0": "builder:item/external_build_wand"
+    "layer0": "agentcraft:item/external_build_wand"
   }
 }

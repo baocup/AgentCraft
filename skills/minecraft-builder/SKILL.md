@@ -20,7 +20,7 @@ POST http://127.0.0.1:8765/mcp        JSON-RPC 2.0，streamable HTTP
 - 协议版本 `2025-06-18`；实现 `initialize` / `ping` / `tools/list` / `tools/call`
 - 若配置了 `mcpToken`，请求头需带 `Authorization: Bearer <token>`
 - 启动日志出现 `[建造] 本地 MCP 已监听 http://127.0.0.1:8765/mcp` 即就绪
-- 端口 / 地址 / token 在 `config/builder-common.toml` 的 `[mcp]` 段（开发环境是 `run/config/`）
+- 端口 / 地址 / token 在 `config/agentcraft-common.toml` 的 `[mcp]` 段（开发环境是 `run/config/`）
 - 同机多开客户端时，每个实例必须配不同 `mcpPort`
 
 **Claude Code**（项目根 `.mcp.json`）：
@@ -186,7 +186,7 @@ url = "http://127.0.0.1:8765/mcp"
 `capture` 在 MCP 下只返回文本，不把图片字节发给你。回执给 `photos / cameras / localReport / captureDir / photoPaths`。照片落盘在：
 
 ```
-<客户端游戏目录>/builder-captures/<taskId>/<regionId>/...
+<客户端游戏目录>/agentcraft-captures/<taskId>/<regionId>/...
 ```
 
 能读本地文件就打开 PNG；不能读就用 `read_state` 核对体素。相机给绝对坐标，`lookAt` 最直观；`view:"plan"` 或 `orthographic:true` 适合大范围俯视。照片只渲染当前区域方块，背景地面不代表真实地形。

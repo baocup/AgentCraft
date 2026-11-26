@@ -27,7 +27,7 @@ import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 
 @Mod(BuilderMod.MODID)
 public class BuilderMod {
-    public static final String MODID = "builder";
+    public static final String MODID = "agentcraft";
     public static final Logger LOGGER = LogUtils.getLogger();
 
     /**
@@ -79,10 +79,10 @@ public class BuilderMod {
         }
     }
 
-    /** /builder status：外部 Agent 只通过玩家客户端 MCP 建造。 */
+    /** /agentcraft status：外部 Agent 只通过玩家客户端 MCP 建造。 */
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
-        event.getDispatcher().register(Commands.literal("builder")
+        event.getDispatcher().register(Commands.literal("agentcraft")
                 .then(Commands.literal("status").executes(context -> {
                     context.getSource().sendSuccess(() -> Component.literal(
                             "§b[外部建造] §f请在客户端连接 MCP：http://127.0.0.1:"
